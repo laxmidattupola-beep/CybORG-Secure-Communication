@@ -10,6 +10,7 @@ import pygame
 from gym.utils import seeding
 
 from CybORG.Simulator.SimulationController import SimulationController
+from CybORG.communication.communication_layer import CommunicationLayer
 from CybORG.Shared import Observation, Results, CybORGLogger
 from CybORG.Shared.Enums import DecoyType
 from CybORG.Shared.Scenarios.ScenarioGenerator import ScenarioGenerator
@@ -75,7 +76,11 @@ class CybORG(CybORGLogger):
         else:
             self.np_random = seed
         self.environment_controller = SimulationController(self.scenario_generator, agents, self.np_random)
+        self.communication_layer = CommunicationLayer()
 
+        self.communication_layer.register_agents(
+        self.environment_controller.agent_interfaces.keys()
+        )
         # # CC4: GUI not implemented for CC4, disable by default
         # self._disable_gui = True
 
