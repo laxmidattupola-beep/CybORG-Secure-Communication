@@ -30,6 +30,8 @@ class BaseAgent:
             np_random, seed = seeding.np_random()
         self.np_random = np_random
 
+        self.communication_layer = None
+
     def train(self, results: Results):
         """Allows an agent to learn a policy
         
@@ -89,6 +91,53 @@ class BaseAgent:
 
     # By default special members (e.g. __special__) and private members (e.g. _private) are not included in docstrings
 
+    def set_communication_layer(self, communication_layer):
+        """
+        Connect this agent to the communication layer.
+        """
+
+        self.communication_layer = communication_layer
+
+    def send_message(self, receiver, message_type, payload):
+        """
+        Send a structured message to another agent.
+        """
+
+        if self.communication_layer is None:
+            raise RuntimeError(
+                "Communication layer has not been connected to this agent."
+            )
+
+        return self.communication_layer.send_message(
+            sender=self.name,
+            receiver=receiver,
+            message_type=message_type,
+            payload=payload
+        )
+
+    def receive_messages(self):
+        """
+        Receive and remove all messages waiting for this agent.
+        """
+
+        if self.communication_layer is None:
+            raise RuntimeError(
+                "Communication layer has not been connected to this agent."
+            )
+
+        return self.communication_layer.receive_messages(self.name)
+
+    def peek_messages(self):
+        """
+        View messages without removing them.
+        """
+
+        if self.communication_layer is None:
+            raise RuntimeError(
+                "Communication layer has not been connected to this agent."
+            )
+
+        return self.communication_layer.peek_messages(self.name)
     def __str__(self):
         return f"{self.__class__.__name__}"
 
