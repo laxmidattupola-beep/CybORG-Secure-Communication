@@ -1,42 +1,30 @@
 from .message import Message
+from cryptography.fernet import Fernet
 
 
 class CommunicationLayer:
-    """
-    Basic agent-to-agent communication layer.
 
-    Stage 2:
-    - Uses structured Message objects.
-    - Allows any CybORG agent to send a message to another agent.
-    - Stores messages in per-agent receive queues.
-
-    Security features such as authentication, encryption,
-    integrity checking, and replay protection will be added later.
-    """
-
-    def __init__(self):
+    def __init__(
+        self,
+        authentication_key: bytes = b"cyborg-secret-key",
+        encryption_key: bytes = None
+    ):
         self.message_queues = {}
+        self.authentication_key = authentication_key
+        self.encryption_key = encryption_key or Fernet.generate_key()
+
+        # Store message IDs that have already been delivered
+        self.processed_message_ids = set()
 
     def register_agent(self, agent_name):
-        """
-        Register an agent with the communication layer.
-        """
-
         if agent_name not in self.message_queues:
             self.message_queues[agent_name] = []
 
     def register_agents(self, agent_names):
-        """
-        Register multiple agents.
-        """
-
         for agent_name in agent_names:
             self.register_agent(agent_name)
 
     def send_message(self, sender, receiver, message_type, payload):
-        """
-        Create and send a structured message from one agent to another.
-        """
 
         if sender not in self.message_queues:
             raise ValueError(f"Unknown sender: {sender}")
@@ -51,30 +39,44 @@ class CommunicationLayer:
             payload=payload
         )
 
+        message.encrypt(self.encryption_key)
+        message.authenticate(self.authentication_key)
+
         self.message_queues[receiver].append(message)
 
         return message
 
     def receive_messages(self, agent_name):
-        """
-        Return all messages received by an agent.
-
-        Messages are removed from the queue after being received.
-        """
 
         if agent_name not in self.message_queues:
             raise ValueError(f"Unknown agent: {agent_name}")
 
         messages = self.message_queues[agent_name].copy()
-
         self.message_queues[agent_name].clear()
 
-        return messages
+        valid_messages = []
+
+        for message in messages:
+
+            # Reject replayed messages
+            if message.message_id in self.processed_message_ids:
+                continue
+
+            # Verify authentication
+            if not message.verify(self.authentication_key):
+                continue
+
+            # Decrypt valid message
+            message.decrypt(self.encryption_key)
+
+            # Mark message as processed
+            self.processed_message_ids.add(message.message_id)
+
+            valid_messages.append(message)
+
+        return valid_messages
 
     def peek_messages(self, agent_name):
-        """
-        View messages without removing them.
-        """
 
         if agent_name not in self.message_queues:
             raise ValueError(f"Unknown agent: {agent_name}")
@@ -82,9 +84,8 @@ class CommunicationLayer:
         return self.message_queues[agent_name].copy()
 
     def clear(self):
-        """
-        Clear all communication queues.
-        """
 
         for agent_name in self.message_queues:
             self.message_queues[agent_name].clear()
+
+        self.processed_message_ids.clear()

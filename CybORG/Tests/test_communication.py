@@ -22,7 +22,10 @@ def test_structured_message():
     assert message.sender == "blue_agent_0"
     assert message.receiver == "blue_agent_1"
     assert message.message_type == "ALERT"
-    assert message.payload == "Host compromised"
+    assert message.payload != "Host compromised"
+    received = communication.receive_messages("blue_agent_1")
+
+    assert received[0].payload == "Host compromised"
 
     assert message.message_id is not None
     assert message.timestamp is not None

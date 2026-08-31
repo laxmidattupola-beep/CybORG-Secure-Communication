@@ -142,16 +142,18 @@ class CybORG(CybORGLogger):
             warnings.warn("Reuse of the actions input. This variable is altered inside the simulation "
                           "and may contain actions from previous steps")
         self.environment_controller.step(actions, skip_valid_action_check)
-        self.environment_controller.send_messages(messages)
+
         if messages is not None:
             for sender, message in messages.items():
                 receivers = self.environment_controller.get_connected_agents(sender)
 
-                self.communication_layer.send_to_connected_agents(
-                    sender=sender,
-                    receivers=receivers,
-                    message=message
-                )
+                for receiver in receivers:
+                    self.communication_layer.send_message(
+                        sender=sender,
+                        receiver=receiver,
+                        message_type="INFO",
+                        payload=message
+                    )
         agents = set(agents + self.active_agents)
         return {agent: self.get_observation(agent) for agent in agents}, \
                {agent: self.environment_controller.get_reward(agent) for agent in agents}, \
