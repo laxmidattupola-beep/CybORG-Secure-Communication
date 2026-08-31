@@ -1,12 +1,17 @@
+from .message import Message
+
+
 class CommunicationLayer:
     """
     Basic agent-to-agent communication layer.
 
-    Stage 1:
+    Stage 2:
+    - Uses structured Message objects.
     - Allows any CybORG agent to send a message to another agent.
     - Stores messages in per-agent receive queues.
-    - No encryption, authentication, integrity checking,
-      replay protection, or attack simulation yet.
+
+    Security features such as authentication, encryption,
+    integrity checking, and replay protection will be added later.
     """
 
     def __init__(self):
@@ -16,6 +21,7 @@ class CommunicationLayer:
         """
         Register an agent with the communication layer.
         """
+
         if agent_name not in self.message_queues:
             self.message_queues[agent_name] = []
 
@@ -23,12 +29,13 @@ class CommunicationLayer:
         """
         Register multiple agents.
         """
+
         for agent_name in agent_names:
             self.register_agent(agent_name)
 
-    def send_message(self, sender, receiver, message):
+    def send_message(self, sender, receiver, message_type, payload):
         """
-        Send a message from one agent to another.
+        Create and send a structured message from one agent to another.
         """
 
         if sender not in self.message_queues:
@@ -37,11 +44,16 @@ class CommunicationLayer:
         if receiver not in self.message_queues:
             raise ValueError(f"Unknown receiver: {receiver}")
 
-        self.message_queues[receiver].append({
-            "sender": sender,
-            "receiver": receiver,
-            "message": message
-        })
+        message = Message(
+            sender=sender,
+            receiver=receiver,
+            message_type=message_type,
+            payload=payload
+        )
+
+        self.message_queues[receiver].append(message)
+
+        return message
 
     def receive_messages(self, agent_name):
         """

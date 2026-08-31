@@ -51,6 +51,22 @@ class CybORG(CybORGLogger):
     """
     supported_envs = ['sim']
 
+    def _connect_agents_to_communication(self):
+        """
+        Connect all CybORG agents to the communication layer.
+        """
+
+        self.communication_layer.clear()
+
+        self.communication_layer.register_agents(
+            self.environment_controller.agent_interfaces.keys()
+        )
+
+        for agent_interface in self.environment_controller.agent_interfaces.values():
+            agent_interface.agent.set_communication_layer(
+                self.communication_layer
+            )
+
     def __init__(self,
                  scenario_generator: ScenarioGenerator,
                  agents: dict = None,
@@ -80,6 +96,11 @@ class CybORG(CybORGLogger):
 
         self.communication_layer.register_agents(
         self.environment_controller.agent_interfaces.keys()
+        )
+
+        for agent_interface in self.environment_controller.agent_interfaces.values():
+            agent_interface.agent.set_communication_layer(
+        self.communication_layer
         )
         # # CC4: GUI not implemented for CC4, disable by default
         # self._disable_gui = True
@@ -122,6 +143,15 @@ class CybORG(CybORGLogger):
                           "and may contain actions from previous steps")
         self.environment_controller.step(actions, skip_valid_action_check)
         self.environment_controller.send_messages(messages)
+        if messages is not None:
+            for sender, message in messages.items():
+                receivers = self.environment_controller.get_connected_agents(sender)
+
+                self.communication_layer.send_to_connected_agents(
+                    sender=sender,
+                    receivers=receivers,
+                    message=message
+                )
         agents = set(agents + self.active_agents)
         return {agent: self.get_observation(agent) for agent in agents}, \
                {agent: self.environment_controller.get_reward(agent) for agent in agents}, \
@@ -241,6 +271,7 @@ class CybORG(CybORGLogger):
         if seed is not None:
             self.np_random, seed = seeding.np_random(seed)
         self.environment_controller.reset(np_random=self.np_random)
+        self._connect_agents_to_communication()
         if agent is None:
             return Results(observation=self.environment_controller.init_state)
         obs = self.environment_controller.observation[agent].get_combined_observation().data
