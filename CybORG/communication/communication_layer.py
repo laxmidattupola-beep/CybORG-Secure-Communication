@@ -1,167 +1,188 @@
-"""
-Communication layer for CybORG blue agents.
-
-Messages are exchanged between blue agents and evaluated by the
-TrustManager.
-
-The communication layer is responsible for:
-
-    Agent
-      |
-      v
-    Message
-      |
-      v
-  Communication
-      |
-      v
-  Authentication
-      |
-      v
- TrustManager
-      |
-      v
- Message accepted / rejected
-
-The research paper describes 8-bit communication between blue agents
-operating under limited bandwidth and partial observability.
-"""
-
-from __future__ import annotations
-
-import base64
 import hashlib
-import json
+import hmac
 import time
 import uuid
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional
-
-try:
-    from cryptography.fernet import Fernet, InvalidToken
-except ImportError:
-    Fernet = None
-    InvalidToken = Exception
+from dataclasses import dataclass
+from typing import Dict, List
 
 from trust.trust_manager import TrustManager
 
 
+# ============================================================
+# MESSAGE ENCODER
+# ============================================================
+
+class MessageEncoder:
+
+    MESSAGE_CODES = {
+        "NORMAL": 0,
+        "SUSPICIOUS_ACTIVITY": 1,
+        "MALWARE_DETECTED": 2,
+        "HOST_COMPROMISED": 3,
+        "LATERAL_MOVEMENT": 4,
+        "HIGH_RISK_ATTACK": 5,
+        "NETWORK_INTRUSION": 6,
+        "PORT_SCAN_DETECTED": 7,
+        "UNAUTHORIZED_ACCESS": 8,
+        "NETWORK_ANOMALY": 9,
+        "PRIVILEGE_ESCALATION": 10,
+        "DATA_EXFILTRATION": 11,
+        "CREDENTIAL_ATTACK": 12,
+
+        "FIREWALL_ENABLED": 20,
+        "FIREWALL_DISABLED": 21,
+        "HOST_ISOLATED": 22,
+        "THREAT_BLOCKED": 23,
+        "INCIDENT_CONTAINED": 24,
+
+        "HOST_SECURE": 30,
+        "HOST_AT_RISK": 31,
+        "NETWORK_SECURE": 32,
+        "NETWORK_AT_RISK": 33,
+
+        "REQUEST_ASSISTANCE": 40,
+        "REQUEST_ISOLATION": 41,
+        "REQUEST_SCAN": 42,
+        "REQUEST_RESPONSE": 43,
+
+        "THREAT_LEVEL_LOW": 50,
+        "THREAT_LEVEL_MEDIUM": 51,
+        "THREAT_LEVEL_HIGH": 52,
+        "THREAT_LEVEL_CRITICAL": 53,
+    }
+
+    @classmethod
+    def encode(cls, message_type: str) -> str:
+
+        if message_type not in cls.MESSAGE_CODES:
+            raise ValueError(
+                f"Unknown message type: {message_type}"
+            )
+
+        return format(
+            cls.MESSAGE_CODES[message_type],
+            "08b"
+        )
+
+    @classmethod
+    def decode(cls, encoded_message: str) -> str:
+
+        if (
+            len(encoded_message) != 8
+            or any(bit not in "01"
+                   for bit in encoded_message)
+        ):
+            raise ValueError(
+                "Message must contain exactly 8 binary bits."
+            )
+
+        code = int(encoded_message, 2)
+
+        for message_type, message_code in cls.MESSAGE_CODES.items():
+
+            if message_code == code:
+                return message_type
+
+        return "UNKNOWN"
+
+
+# ============================================================
+# MESSAGE
+# ============================================================
+
 @dataclass
 class Message:
-    """
-    Structured inter-agent message.
-    """
 
     message_id: str
     sender: str
     receiver: str
+
     message_type: str
-    payload: dict
+    encoded_message: str
+
+    target_type: str
+    target_id: int
+    target_name: str
+
     timestamp: float
     sequence_number: int
+
     signature: str = ""
 
-    def to_dict(self) -> dict:
-        return asdict(self)
 
-    def to_json(self) -> str:
-        return json.dumps(
-            self.to_dict(),
-            separators=(",", ":"),
-        )
-
-    @classmethod
-    def from_json(
-        cls,
-        data: str,
-    ) -> "Message":
-        return cls(
-            **json.loads(data)
-        )
-
+# ============================================================
+# COMMUNICATION LAYER
+# ============================================================
 
 class CommunicationLayer:
-    """
-    Handles structured communication between blue agents.
-
-    Trust is maintained independently for every sender.
-    """
 
     def __init__(
         self,
         agent_id: str,
-        agent_ids: Optional[List[str]] = None,
-        trust_manager: Optional[TrustManager] = None,
+        agent_ids: List[str],
+        trust_manager: TrustManager,
+        shared_secret: bytes
     ):
+
         self.agent_id = agent_id
+        self.agent_ids = agent_ids
+        self.trust_manager = trust_manager
+        self.shared_secret = shared_secret
 
-        self.trust_manager = (
-            trust_manager
-            if trust_manager is not None
-            else TrustManager()
-        )
-
-        self.agent_ids = list(
-            agent_ids or []
-        )
-
-        if self.agent_id not in self.agent_ids:
-            self.agent_ids.append(
-                self.agent_id
-            )
-
-        for agent in self.agent_ids:
-            self.trust_manager.register_agent(
-                agent
-            )
-
-        self.outbox: List[Message] = []
         self.inbox: List[Message] = []
-
-        self.processed_message_ids = set()
+        self.outbox: List[Message] = []
 
         self.sequence_number = 0
 
-        self.shared_secret = self._generate_secret()
+        # Store processed message IDs
+        self.processed_message_ids = set()
 
-    # ------------------------------------------------------------------
-    # Secret
-    # ------------------------------------------------------------------
+    # ========================================================
+    # CREATE HMAC
+    # ========================================================
 
-    @staticmethod
-    def _generate_secret() -> bytes:
-        """
-        Generate a deterministic local secret.
+    def _create_hmac(self, message: Message) -> str:
 
-        The actual network implementation can replace this with a
-        shared key-distribution mechanism.
-        """
+        data = (
+            f"{message.message_id}|"
+            f"{message.sender}|"
+            f"{message.receiver}|"
+            f"{message.message_type}|"
+            f"{message.encoded_message}|"
+            f"{message.target_type}|"
+            f"{message.target_id}|"
+            f"{message.target_name}|"
+            f"{message.timestamp}|"
+            f"{message.sequence_number}"
+        )
 
-        return Fernet.generate_key() if Fernet else b"cyborg-local-key"
+        return hmac.new(
+            self.shared_secret,
+            data.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
 
-    # ------------------------------------------------------------------
-    # Sending
-    # ------------------------------------------------------------------
+    # ========================================================
+    # CREATE MESSAGE
+    # ========================================================
 
-    def send_message(
+    def _create_message(
         self,
         receiver: str,
         message_type: str,
-        payload: dict,
+        target_type: str,
+        target_id: int,
+        target_name: str
     ) -> Message:
-        """
-        Create and queue a structured message.
-        """
 
-        if not isinstance(payload, dict):
-            raise TypeError(
-                "payload must be a dictionary."
-            )
-
-        if receiver == self.agent_id:
+        if not 0 <= target_id <= 255:
             raise ValueError(
-                "An agent cannot send a message to itself."
+                "Target ID must be between 0 and 255."
             )
+
+        encoded_message = MessageEncoder.encode(
+            message_type
+        )
 
         self.sequence_number += 1
 
@@ -170,124 +191,178 @@ class CommunicationLayer:
             sender=self.agent_id,
             receiver=receiver,
             message_type=message_type,
-            payload=payload,
+            encoded_message=encoded_message,
+            target_type=target_type,
+            target_id=target_id,
+            target_name=target_name,
             timestamp=time.time(),
-            sequence_number=self.sequence_number,
+            sequence_number=self.sequence_number
         )
 
-        message.signature = self._sign_message(
-            message
-        )
+        message.signature = self._create_hmac(message)
 
         self.outbox.append(message)
 
         return message
 
-    # ------------------------------------------------------------------
-    # Receiving
-    # ------------------------------------------------------------------
+    # ========================================================
+    # BROADCAST
+    # ========================================================
+
+    def broadcast_message(
+        self,
+        message_type: str,
+        target_type: str,
+        target_id: int,
+        target_name: str
+    ) -> List[Message]:
+
+        messages = []
+
+        for receiver in self.agent_ids:
+
+            if receiver == self.agent_id:
+                continue
+
+            message = self._create_message(
+                receiver=receiver,
+                message_type=message_type,
+                target_type=target_type,
+                target_id=target_id,
+                target_name=target_name
+            )
+
+            messages.append(message)
+
+        return messages
+
+    # ========================================================
+    # VERIFY HMAC
+    # ========================================================
+
+    def verify_hmac(self, message: Message) -> bool:
+
+        expected_signature = self._create_hmac(
+            message
+        )
+
+        return hmac.compare_digest(
+            expected_signature,
+            message.signature
+        )
+
+    # ========================================================
+    # RECEIVE MESSAGE
+    # ========================================================
 
     def receive_message(
         self,
         message: Message,
-    ) -> Optional[dict]:
-        """
-        Receive and validate a message.
-
-        Authentication and replay protection are performed before
-        the message is accepted.
-
-        Trust is updated after validation.
-        """
-
-        if not isinstance(message, Message):
-            raise TypeError(
-                "message must be a Message object."
-            )
+        update_trust: bool = True
+    ) -> Dict:
 
         sender = message.sender
 
-        self.trust_manager.register_agent(
-            sender
-        )
+        # Make sure sender exists in TrustManager
+        self.trust_manager.register_agent(sender)
 
-        # --------------------------------------------------------------
+        # ----------------------------------------------------
         # Receiver validation
-        # --------------------------------------------------------------
+        # ----------------------------------------------------
 
         if message.receiver != self.agent_id:
-            self.trust_manager.update_trust(
-                sender,
-                successful_communication=False,
-                authentication=False,
-                behavior=False,
-            )
 
-            return None
+            if update_trust:
+                self.trust_manager.update_trust(
+                    sender,
+                    successful_communication=False,
+                    authentication=False,
+                    behavior=False
+                )
 
-        # --------------------------------------------------------------
-        # Replay protection
-        # --------------------------------------------------------------
+            return {
+                "accepted": False,
+                "reason": "WRONG_RECEIVER",
+                "authentication": False,
+                "replay": False
+            }
 
-        if (
-            message.message_id
-            in self.processed_message_ids
-        ):
-            self.trust_manager.update_trust(
-                sender,
-                successful_communication=False,
-                authentication=True,
-                behavior=False,
-            )
+        # ----------------------------------------------------
+        # HMAC authentication
+        # ----------------------------------------------------
 
-            return None
-
-        # --------------------------------------------------------------
-        # Signature validation
-        # --------------------------------------------------------------
-
-        authenticated = self._verify_signature(
+        authentication_valid = self.verify_hmac(
             message
         )
 
-        if not authenticated:
-            self.trust_manager.update_trust(
-                sender,
-                successful_communication=False,
-                authentication=False,
-                behavior=False,
+        if not authentication_valid:
+
+            if update_trust:
+                self.trust_manager.update_trust(
+                    sender,
+                    successful_communication=False,
+                    authentication=False,
+                    behavior=False
+                )
+
+            return {
+                "accepted": False,
+                "reason": "TAMPERING_DETECTED",
+                "authentication": False,
+                "replay": False
+            }
+
+        # ----------------------------------------------------
+        # Replay protection
+        # ----------------------------------------------------
+
+        if message.message_id in self.processed_message_ids:
+
+            if update_trust:
+                self.trust_manager.update_trust(
+                    sender,
+                    successful_communication=False,
+                    authentication=True,
+                    behavior=False
+                )
+
+            return {
+                "accepted": False,
+                "reason": "REPLAY_ATTACK_BLOCKED",
+                "authentication": True,
+                "replay": False
+            }
+
+        # ----------------------------------------------------
+        # Validate 8-bit message
+        # ----------------------------------------------------
+
+        if (
+            len(message.encoded_message) != 8
+            or any(
+                bit not in "01"
+                for bit in message.encoded_message
             )
+        ):
 
-            return None
+            return {
+                "accepted": False,
+                "reason": "INVALID_8_BIT_MESSAGE",
+                "authentication": True,
+                "replay": True
+            }
 
-        # --------------------------------------------------------------
-        # Message validation
-        # --------------------------------------------------------------
+        # ----------------------------------------------------
+        # Decode
+        # ----------------------------------------------------
 
-        valid_payload = self._validate_payload(
-            message.payload
+        decoded_message = MessageEncoder.decode(
+            message.encoded_message
         )
 
-        if not valid_payload:
-            self.trust_manager.update_trust(
-                sender,
-                successful_communication=False,
-                authentication=True,
-                behavior=False,
-            )
-
-            return None
-
-        # --------------------------------------------------------------
-        # Successful communication
-        # --------------------------------------------------------------
-
-        trust = self.trust_manager.update_trust(
-            sender,
-            successful_communication=True,
-            authentication=True,
-            behavior=True,
-        )
+        # ----------------------------------------------------
+        # Accept message
+        # ----------------------------------------------------
 
         self.processed_message_ids.add(
             message.message_id
@@ -295,202 +370,150 @@ class CommunicationLayer:
 
         self.inbox.append(message)
 
+        # ----------------------------------------------------
+        # Update trust
+        # ----------------------------------------------------
+
+        if update_trust:
+
+            trust = self.trust_manager.update_trust(
+                sender,
+                successful_communication=True,
+                authentication=True,
+                behavior=True
+            )
+
+        else:
+
+            trust = self.trust_manager.get_trust(
+                sender
+            )
+
         return {
-            "message_id": message.message_id,
-            "sender": sender,
-            "receiver": message.receiver,
-            "message_type": message.message_type,
-            "payload": message.payload,
+            "accepted": True,
+            "reason": "MESSAGE_ACCEPTED",
+
+            "authentication": True,
+            "replay": True,
+
+            "decoded_message": decoded_message,
+
+            "target_type": message.target_type,
+            "target_id": message.target_id,
+            "target_name": message.target_name,
+
             "trust": trust,
+
             "trusted": self.trust_manager.is_trusted(
                 sender
-            ),
+            )
         }
 
-    # ------------------------------------------------------------------
-    # Message verification
-    # ------------------------------------------------------------------
 
-    def _sign_message(
-        self,
-        message: Message,
-    ) -> str:
-        """
-        Generate a signature for the message.
-        """
+# ============================================================
+# MULTI-AGENT COMMUNICATION NETWORK
+# ============================================================
 
-        unsigned = {
-            "message_id": message.message_id,
-            "sender": message.sender,
-            "receiver": message.receiver,
-            "message_type": message.message_type,
-            "payload": message.payload,
-            "timestamp": message.timestamp,
-            "sequence_number": message.sequence_number,
-        }
+class MultiAgentCommunicationNetwork:
 
-        serialized = json.dumps(
-            unsigned,
-            sort_keys=True,
-            separators=(",", ":"),
+    def __init__(self, agent_ids: List[str]):
+
+        self.agent_ids = agent_ids
+
+        # ----------------------------------------------------
+        # ONE TRUST MANAGER
+        # ----------------------------------------------------
+
+        self.trust_manager = TrustManager()
+
+        # Register all agents using the existing
+        # TrustManager interface.
+        self.trust_manager.register_agents(
+            agent_ids
         )
 
-        digest = hashlib.sha256(
-            serialized.encode("utf-8")
-        ).digest()
+        # ----------------------------------------------------
+        # ONE SHARED SECRET
+        # ----------------------------------------------------
 
-        return base64.b64encode(
-            digest
-        ).decode("utf-8")
-
-    def _verify_signature(
-        self,
-        message: Message,
-    ) -> bool:
-        """
-        Verify the message signature.
-        """
-
-        expected = self._sign_message(
-            message
+        self.shared_secret = (
+            b"CYBORG_SECURE_SHARED_SECRET_2026"
         )
 
-        return expected == message.signature
+        # ----------------------------------------------------
+        # Create communication layer for each agent
+        # ----------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Payload validation
-    # ------------------------------------------------------------------
+        self.agents = {}
 
-    @staticmethod
-    def _validate_payload(
-        payload: dict,
-    ) -> bool:
-        """
-        Validate structured message payload.
+        for agent_id in agent_ids:
 
-        A payload must be a dictionary.
-        """
+            self.agents[agent_id] = CommunicationLayer(
+                agent_id=agent_id,
+                agent_ids=agent_ids,
+                trust_manager=self.trust_manager,
+                shared_secret=self.shared_secret
+            )
 
-        if not isinstance(payload, dict):
-            return False
+    # ========================================================
+    # BROADCAST
+    # ========================================================
 
-        return True
-
-    # ------------------------------------------------------------------
-    # Trust
-    # ------------------------------------------------------------------
-
-    def get_sender_trust(
+    def broadcast(
         self,
         sender: str,
-    ) -> float:
-        """
-        Get current trust of another agent.
-        """
+        message_type: str,
+        target_type: str,
+        target_id: int,
+        target_name: str
+    ) -> List[Message]:
 
-        return self.trust_manager.get_trust(
-            sender
+        if sender not in self.agents:
+
+            raise ValueError(
+                f"Unknown sender: {sender}"
+            )
+
+        return self.agents[sender].broadcast_message(
+            message_type=message_type,
+            target_type=target_type,
+            target_id=target_id,
+            target_name=target_name
         )
 
-    def is_sender_trusted(
+    # ========================================================
+    # DELIVER
+    # ========================================================
+
+    def deliver_message(
         self,
-        sender: str,
-        threshold: float = 0.5,
-    ) -> bool:
-        """
-        Determine whether a sender is trusted.
-        """
+        message: Message,
+        update_trust: bool = True
+    ) -> Dict:
 
-        return self.trust_manager.is_trusted(
-            sender,
-            threshold=threshold,
+        receiver = self.agents.get(
+            message.receiver
         )
 
-    # ------------------------------------------------------------------
-    # Queues
-    # ------------------------------------------------------------------
+        if receiver is None:
 
-    def peek_messages(self) -> List[Message]:
-        """
-        Return messages currently in the inbox.
-        """
+            return {
+                "accepted": False,
+                "reason": "UNKNOWN_RECEIVER"
+            }
 
-        return list(self.inbox)
-
-    def clear_messages(self) -> None:
-        """
-        Clear received messages.
-        """
-
-        self.inbox.clear()
-
-    def get_outbox(self) -> List[Message]:
-        """
-        Return queued outgoing messages.
-        """
-
-        return list(self.outbox)
-
-    def clear_outbox(self) -> None:
-        """
-        Clear outgoing messages.
-        """
-
-        self.outbox.clear()
-
-    # ------------------------------------------------------------------
-    # 8-bit communication
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def encode_8bit(
-        value: int,
-    ) -> str:
-        """
-        Encode an integer into an 8-bit binary string.
-
-        Valid range:
-
-            0 <= value <= 255
-        """
-
-        if not isinstance(value, int):
-            raise TypeError(
-                "8-bit value must be an integer."
-            )
-
-        if not 0 <= value <= 255:
-            raise ValueError(
-                "8-bit value must be between 0 and 255."
-            )
-
-        return format(
-            value,
-            "08b",
+        return receiver.receive_message(
+            message,
+            update_trust=update_trust
         )
 
-    @staticmethod
-    def decode_8bit(
-        value: str,
-    ) -> int:
-        """
-        Decode an 8-bit binary string.
-        """
+    # ========================================================
+    # GET AGENT
+    # ========================================================
 
-        if not isinstance(value, str):
-            raise TypeError(
-                "8-bit value must be a string."
-            )
+    def get_agent(
+        self,
+        agent_id: str
+    ):
 
-        if (
-            len(value) != 8
-            or any(bit not in "01" for bit in value)
-        ):
-            raise ValueError(
-                "Value must be exactly 8 binary bits."
-            )
-
-        return int(
-            value,
-            2,
-        )
+        return self.agents.get(agent_id)
