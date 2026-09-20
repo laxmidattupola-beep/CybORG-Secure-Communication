@@ -1,288 +1,536 @@
-import inspect
 import numpy as np
 
 from CybORG import CybORG
-from CybORG.Agents import (
-    SleepAgent,
-    EnterpriseGreenAgent,
-    FiniteStateRedAgent
-)
 from CybORG.Simulator.Scenarios.EnterpriseScenarioGenerator import (
-    EnterpriseScenarioGenerator
+    EnterpriseScenarioGenerator,
+)
+
+from CybORG.Agents.SimpleAgents.EnterpriseGreenAgent import (
+    EnterpriseGreenAgent,
+)
+from CybORG.Agents.SimpleAgents.FiniteStateRedAgent import (
+    FiniteStateRedAgent,
+)
+
+from CybORG.communication.communication_layer import (
+    MultiAgentCommunicationNetwork,
 )
 
 
 class CybORGMAPPOEnv:
     """
-    Adapter between CybORG and our custom MAPPO implementation.
+    Custom CybORG environment for MAPPO.
 
-    - Controls the 5 blue agents
-    - Converts CybORG observations into fixed-size vectors
-    - Converts discrete MAPPO actions into real CybORG actions
-    - Collects rewards
+    Features:
+        - 5 Blue agents controlled by MAPPO
+        - Fixed observation dimension
+        - Global target-aware action space
+        - Agent-specific action masks
+        - Secure communication network
+        - Positive rewards
+        - Compatible with CybORG tuple-based parallel_step()
     """
 
-    # CybORG high-level actions
-    ACTION_NAMES = [
-        "AllowTrafficZone",
-        "BlockTrafficZone",
-        "Monitor",
-        "Analyse",
-        "Restore",
-        "Remove",
-        "DeployDecoy",
-        "Sleep"
-    ]
+    def __init__(self, steps=50):
 
-    def __init__(self, steps=100):
         self.steps = steps
 
-        # ---------------------------------------------------------
-        # Create CybORG scenario
-        # ---------------------------------------------------------
+        # =========================================================
+        # CREATE CYBORG SCENARIO
+        # =========================================================
+
         scenario_generator = EnterpriseScenarioGenerator(
-            blue_agent_class=SleepAgent,
-            green_agent_class=EnterpriseGreenAgent,
             red_agent_class=FiniteStateRedAgent,
-            steps=steps
+            green_agent_class=EnterpriseGreenAgent,
+            steps=steps,
         )
 
         self.env = CybORG(
-            scenario_generator=scenario_generator
+            scenario_generator=scenario_generator,
+            seed=0,
         )
 
-        # ---------------------------------------------------------
-        # Blue agents
-        # ---------------------------------------------------------
-        self.agent_ids = [
-            agent_id
-            for agent_id in self.env.environment_controller.agent_interfaces
-            if agent_id.startswith("blue_agent")
-        ]
+        # =========================================================
+        # BLUE AGENTS
+        # =========================================================
 
-        self.agent_ids.sort()
+        self.agent_ids = sorted(
+            [
+                agent_id
+                for agent_id in self.env.agents
+                if agent_id.startswith("blue_agent")
+            ]
+        )
 
-        self.num_agents = len(self.agent_ids)
+        # =========================================================
+        # OBSERVATION
+        # =========================================================
 
-        # ---------------------------------------------------------
-        # MAPPO settings
-        # ---------------------------------------------------------
-
-        # FIXED observation size
         self.observation_dim = 256
 
-        # 8 high-level CybORG actions
-        self.action_dim = 8
+        # =========================================================
+        # SECURE COMMUNICATION
+        # =========================================================
 
-        # ---------------------------------------------------------
-        # Connect secure communication layer
-        # ---------------------------------------------------------
+        self.communication_network = None
+
         self._connect_agents_to_communication()
 
+        # =========================================================
+        # ACTION MAPPINGS
+        # =========================================================
+
+        self.global_action_mapping = []
+
+        self.action_mappings = {}
+
+        self.action_masks = {}
+
+        self._build_global_action_mappings()
+
+        self.action_dim = len(
+            self.global_action_mapping
+        )
+
     # =============================================================
-    # Communication
+    # COMMUNICATION
     # =============================================================
 
     def _connect_agents_to_communication(self):
-        """
-        Connect all CybORG agents to the secure communication
-        network already implemented in the project.
-        """
 
         try:
-            from CybORG.communication.communication_layer import (
-                MultiAgentCommunicationNetwork
+
+            self.communication_network = (
+                MultiAgentCommunicationNetwork(
+                    self.agent_ids
+                )
             )
 
-            agent_ids = list(
-                self.env.environment_controller.agent_interfaces.keys()
-            )
+        except TypeError:
 
-            self.communication_layer = (
-                MultiAgentCommunicationNetwork(agent_ids)
-            )
+            try:
 
-            for agent_interface in (
-                self.env.environment_controller.agent_interfaces.values()
-            ):
-                agent = agent_interface.agent
-
-                if hasattr(agent, "set_communication_layer"):
-                    agent.set_communication_layer(
-                        self.communication_layer
+                self.communication_network = (
+                    MultiAgentCommunicationNetwork(
+                        agent_ids=self.agent_ids
                     )
+                )
 
-        except Exception as error:
-            print(
-                "Warning: Secure communication layer could not "
-                f"be connected: {error}"
-            )
+            except Exception:
 
-            self.communication_layer = None
+                self.communication_network = None
+
+        except Exception:
+
+            self.communication_network = None
 
     # =============================================================
-    # Observation handling
+    # OBSERVATION PROCESSING
     # =============================================================
 
-    def _flatten_observation(self, observation):
-        """
-        Recursively convert a CybORG observation dictionary into
-        numerical values.
-        """
+    def _flatten_observation(
+        self,
+        observation,
+    ):
 
         values = []
 
-        def flatten(value):
+        def recursive_flatten(value):
 
+            if value is None:
+                return
+
+            # -----------------------------------------------------
             # Dictionary
-            if isinstance(value, dict):
+            # -----------------------------------------------------
 
-                for item in value.values():
-                    flatten(item)
+            if isinstance(
+                value,
+                dict,
+            ):
 
-            # List / tuple
-            elif isinstance(value, (list, tuple)):
+                for key in sorted(
+                    value.keys(),
+                    key=str,
+                ):
+
+                    recursive_flatten(
+                        value[key]
+                    )
+
+            # -----------------------------------------------------
+            # List / Tuple
+            # -----------------------------------------------------
+
+            elif isinstance(
+                value,
+                (list, tuple),
+            ):
 
                 for item in value:
-                    flatten(item)
 
-            # Boolean
-            elif isinstance(value, bool):
+                    recursive_flatten(
+                        item
+                    )
 
-                values.append(float(value))
+            # -----------------------------------------------------
+            # NumPy Array
+            # -----------------------------------------------------
 
-            # Numeric values
-            elif isinstance(value, (int, float, np.integer, np.floating)):
+            elif isinstance(
+                value,
+                np.ndarray,
+            ):
 
-                values.append(float(value))
+                for item in value.flatten():
 
-            else:
+                    if np.isscalar(item):
 
-                # Try converting other simple values to float
-                try:
-                    values.append(float(value))
-                except (TypeError, ValueError):
-                    pass
+                        try:
 
-        flatten(observation)
+                            values.append(
+                                float(item)
+                            )
 
-        return np.asarray(
-            values,
-            dtype=np.float32
-        )
+                        except Exception:
 
-    def _process_observation(self, observation):
-        """
-        Convert a raw CybORG observation into a fixed-size
-        256-dimensional vector.
+                            pass
 
-        If the raw observation is smaller than 256:
-            zero padding is added.
+            # -----------------------------------------------------
+            # Numeric value
+            # -----------------------------------------------------
 
-        If larger than 256:
-            extra values are truncated.
-        """
+            elif isinstance(
+                value,
+                (
+                    int,
+                    float,
+                    np.integer,
+                    np.floating,
+                    bool,
+                ),
+            ):
 
-        vector = self._flatten_observation(
+                values.append(
+                    float(value)
+                )
+
+        recursive_flatten(
             observation
         )
 
-        # ---------------------------------------------------------
-        # Padding
-        # ---------------------------------------------------------
-
-        if len(vector) < self.observation_dim:
-
-            vector = np.pad(
-                vector,
-                (
-                    0,
-                    self.observation_dim - len(vector)
-                ),
-                mode="constant"
-            )
-
-        # ---------------------------------------------------------
-        # Truncation
-        # ---------------------------------------------------------
-
-        elif len(vector) > self.observation_dim:
-
-            vector = vector[
-                :self.observation_dim
-            ]
-
-        return vector.astype(
-            np.float32
+        return np.asarray(
+            values,
+            dtype=np.float32,
         )
 
+    def _process_observation(
+        self,
+        observation,
+    ):
+
+        flattened = (
+            self._flatten_observation(
+                observation
+            )
+        )
+
+        result = np.zeros(
+            self.observation_dim,
+            dtype=np.float32,
+        )
+
+        size = min(
+            len(flattened),
+            self.observation_dim,
+        )
+
+        if size > 0:
+
+            result[:size] = (
+                flattened[:size]
+            )
+
+        return result
+
     # =============================================================
-    # Reset
+    # RESET
     # =============================================================
+
     def reset(self):
-        """
-        Reset CybORG and return processed observations.
-        """
 
         results = self.env.reset()
 
-        # Reconnect communication after reset
-        self._connect_agents_to_communication()
+        # ---------------------------------------------------------
+        # Handle CybORG reset result
+        # ---------------------------------------------------------
+
+        if isinstance(
+            results,
+            tuple,
+        ):
+
+            raw_observations = (
+                results[0]
+            )
+
+        else:
+
+            raw_observations = getattr(
+                results,
+                "observation",
+                results,
+            )
 
         observations = {}
 
         for agent_id in self.agent_ids:
 
-            try:
-                # CybORG reset() returns a Results object.
-                # The actual observations are stored here.
-                raw_observation = results.observation[agent_id]
+            if (
+                isinstance(
+                    raw_observations,
+                    dict,
+                )
+                and agent_id
+                in raw_observations
+            ):
 
-                observations[agent_id] = (
-                    self._process_observation(
-                        raw_observation
-                    )
+                observations[
+                    agent_id
+                ] = self._process_observation(
+                    raw_observations[
+                        agent_id
+                    ]
                 )
 
-            except Exception:
-                # If an observation is unavailable,
-                # use a zero vector.
-                observations[agent_id] = np.zeros(
+            else:
+
+                observations[
+                    agent_id
+                ] = np.zeros(
                     self.observation_dim,
-                    dtype=np.float32
+                    dtype=np.float32,
                 )
 
         return observations
-    # =============================================================
-    # Agent information
-    # =============================================================
-
-    def get_agent_ids(self):
-        return self.agent_ids
-
-    def get_num_agents(self):
-        return self.num_agents
-
-    def get_observation_dim(self):
-        return self.observation_dim
-
-    def get_action_dim(self):
-        return self.action_dim
 
     # =============================================================
-    # Action class
+    # FIND ACTION CLASS
     # =============================================================
 
     def _find_action_class(
         self,
-        agent_id,
-        action_name
+        action_name,
+    ):
+
+        import CybORG.Simulator.Actions as actions_module
+
+        return getattr(
+            actions_module,
+            action_name,
+            None,
+        )
+
+    # =============================================================
+    # GET VALID VALUES
+    # =============================================================
+
+    def _get_all_valid_values(
+        self,
+        space,
+        key,
     ):
         """
-        Find the actual CybORG action class.
+        CybORG action spaces use dictionaries like:
 
-        CybORG stores action classes as dictionary keys.
+            {
+                value_1: True,
+                value_2: False,
+                value_3: True
+            }
+
+        True means the value is currently valid.
+
+        Therefore we return only the KEYS whose value is True.
         """
+
+        try:
+
+            if key not in space:
+
+                return []
+
+            values = space[key]
+
+            if values is None:
+
+                return []
+
+            # -----------------------------------------------------
+            # CybORG dictionary format
+            # -----------------------------------------------------
+
+            if isinstance(
+                values,
+                dict,
+            ):
+
+                valid_values = []
+
+                for actual_value, is_valid in (
+                    values.items()
+                ):
+
+                    if is_valid is True:
+
+                        valid_values.append(
+                            actual_value
+                        )
+
+                return valid_values
+
+            # -----------------------------------------------------
+            # Other iterable formats
+            # -----------------------------------------------------
+
+            if isinstance(
+                values,
+                (list, tuple, set),
+            ):
+
+                return list(
+                    values
+                )
+
+            # -----------------------------------------------------
+            # Single value
+            # -----------------------------------------------------
+
+            return [
+                values
+            ]
+
+        except Exception:
+
+            return []
+
+    # =============================================================
+    # ACTION KEY
+    # =============================================================
+
+    def _action_key(
+        self,
+        action,
+    ):
+
+        action_name = action[
+            "action_name"
+        ]
+
+        # ---------------------------------------------------------
+        # SLEEP
+        # ---------------------------------------------------------
+
+        if action_name == "Sleep":
+
+            return (
+                "Sleep",
+            )
+
+        # ---------------------------------------------------------
+        # MONITOR
+        # ---------------------------------------------------------
+
+        if action_name == "Monitor":
+
+            return (
+                "Monitor",
+                action.get(
+                    "session"
+                ),
+                action.get(
+                    "agent"
+                ),
+            )
+
+        # ---------------------------------------------------------
+        # HOST ACTIONS
+        # ---------------------------------------------------------
+
+        if action_name in [
+            "Analyse",
+            "Restore",
+            "Remove",
+            "DeployDecoy",
+        ]:
+
+            return (
+                action_name,
+                action.get(
+                    "session"
+                ),
+                action.get(
+                    "agent"
+                ),
+                action.get(
+                    "hostname"
+                ),
+            )
+
+        # ---------------------------------------------------------
+        # TRAFFIC ACTIONS
+        # ---------------------------------------------------------
+
+        if action_name in [
+            "AllowTrafficZone",
+            "BlockTrafficZone",
+        ]:
+
+            return (
+                action_name,
+                action.get(
+                    "session"
+                ),
+                action.get(
+                    "agent"
+                ),
+                str(
+                    action.get(
+                        "from_subnet"
+                    )
+                ),
+                str(
+                    action.get(
+                        "to_subnet"
+                    )
+                ),
+            )
+
+        return tuple(
+            sorted(
+                (
+                    key,
+                    str(value),
+                )
+                for key, value in action.items()
+                if key != "action_name"
+            )
+        )
+
+    # =============================================================
+    # BUILD AGENT ACTION CANDIDATES
+    # =============================================================
+
+    def _build_agent_action_candidates(
+        self,
+        agent_id,
+    ):
+
+        candidates = []
+
+        # ---------------------------------------------------------
+        # GET CYBORG ACTION SPACE
+        # ---------------------------------------------------------
 
         try:
 
@@ -292,361 +540,622 @@ class CybORGMAPPOEnv:
                 )
             )
 
-            action_options = action_space.get(
-                "action",
-                {}
+        except Exception:
+
+            action_space = {}
+
+        # ---------------------------------------------------------
+        # SLEEP
+        # ---------------------------------------------------------
+
+        candidates.append(
+            {
+                "action_name": "Sleep"
+            }
+        )
+
+        # ---------------------------------------------------------
+        # SESSIONS
+        # ---------------------------------------------------------
+
+        sessions = (
+            self._get_all_valid_values(
+                action_space,
+                "session",
+            )
+        )
+
+        # ---------------------------------------------------------
+        # MONITOR
+        # ---------------------------------------------------------
+
+        for session in sessions:
+
+            candidates.append(
+                {
+                    "action_name": "Monitor",
+                    "session": session,
+                    "agent": agent_id,
+                }
             )
 
-            for action_class in action_options.keys():
+        # ---------------------------------------------------------
+        # HOSTNAMES
+        # ---------------------------------------------------------
 
-                if action_class.__name__ == action_name:
+        hostnames = (
+            self._get_all_valid_values(
+                action_space,
+                "hostname",
+            )
+        )
 
-                    return action_class
+        # ---------------------------------------------------------
+        # HOST ACTIONS
+        # ---------------------------------------------------------
 
-        except Exception:
-            pass
+        for session in sessions:
 
-        return None
+            for hostname in hostnames:
+
+                for action_name in [
+                    "Analyse",
+                    "Restore",
+                    "Remove",
+                    "DeployDecoy",
+                ]:
+
+                    candidates.append(
+                        {
+                            "action_name":
+                                action_name,
+
+                            "session":
+                                session,
+
+                            "agent":
+                                agent_id,
+
+                            "hostname":
+                                hostname,
+                        }
+                    )
+
+        # ---------------------------------------------------------
+        # SUBNETS
+        # ---------------------------------------------------------
+
+        subnets = (
+            self._get_all_valid_values(
+                action_space,
+                "subnet",
+            )
+        )
+
+        # ---------------------------------------------------------
+        # TRAFFIC ACTIONS
+        # ---------------------------------------------------------
+
+        for session in sessions:
+
+            for subnet in subnets:
+
+                candidates.append(
+                    {
+                        "action_name":
+                            "AllowTrafficZone",
+
+                        "session":
+                            session,
+
+                        "agent":
+                            agent_id,
+
+                        "from_subnet":
+                            subnet,
+
+                        "to_subnet":
+                            subnet,
+                    }
+                )
+
+                candidates.append(
+                    {
+                        "action_name":
+                            "BlockTrafficZone",
+
+                        "session":
+                            session,
+
+                        "agent":
+                            agent_id,
+
+                        "from_subnet":
+                            subnet,
+
+                        "to_subnet":
+                            str(subnet),
+                    }
+                )
+
+        return candidates
 
     # =============================================================
-    # Parameter selection
+    # BUILD GLOBAL ACTION MAPPING
     # =============================================================
 
-    def _get_parameter_value(
-        self,
-        parameter_values
-    ):
-        """
-        Select the first currently valid parameter.
-        """
+    def _build_global_action_mappings(self):
 
-        if not isinstance(
-            parameter_values,
-            dict
-        ):
-            return None
+        global_actions = []
 
-        for value, enabled in parameter_values.items():
+        global_keys = {}
 
-            if enabled:
-                return value
+        # ---------------------------------------------------------
+        # COLLECT ACTIONS
+        # ---------------------------------------------------------
 
-        return None
+        for agent_id in self.agent_ids:
 
-    def _build_action_parameters(
+            candidates = (
+                self._build_agent_action_candidates(
+                    agent_id
+                )
+            )
+
+            for action in candidates:
+
+                key = (
+                    self._action_key(
+                        action
+                    )
+                )
+
+                if key not in global_keys:
+
+                    global_keys[
+                        key
+                    ] = len(
+                        global_actions
+                    )
+
+                    global_actions.append(
+                        action.copy()
+                    )
+
+        # ---------------------------------------------------------
+        # ENSURE ONLY ONE SLEEP
+        # ---------------------------------------------------------
+
+        sleep_found = False
+
+        cleaned_actions = []
+
+        for action in global_actions:
+
+            if action[
+                "action_name"
+            ] == "Sleep":
+
+                if sleep_found:
+
+                    continue
+
+                sleep_found = True
+
+            cleaned_actions.append(
+                action
+            )
+
+        if not sleep_found:
+
+            cleaned_actions.insert(
+                0,
+                {
+                    "action_name":
+                        "Sleep"
+                },
+            )
+
+        self.global_action_mapping = (
+            cleaned_actions
+        )
+
+        # ---------------------------------------------------------
+        # BUILD MASKS
+        # ---------------------------------------------------------
+
+        for agent_id in self.agent_ids:
+
+            candidates = (
+                self._build_agent_action_candidates(
+                    agent_id
+                )
+            )
+
+            valid_keys = {
+                self._action_key(
+                    action
+                )
+                for action in candidates
+            }
+
+            mask = np.zeros(
+                len(
+                    self.global_action_mapping
+                ),
+                dtype=np.float32,
+            )
+
+            for index, action in enumerate(
+                self.global_action_mapping
+            ):
+
+                key = (
+                    self._action_key(
+                        action
+                    )
+                )
+
+                if key in valid_keys:
+
+                    mask[index] = 1.0
+
+            # -----------------------------------------------------
+            # Sleep always valid
+            # -----------------------------------------------------
+
+            for index, action in enumerate(
+                self.global_action_mapping
+            ):
+
+                if (
+                    action[
+                        "action_name"
+                    ]
+                    == "Sleep"
+                ):
+
+                    mask[index] = 1.0
+
+            self.action_masks[
+                agent_id
+            ] = mask
+
+            self.action_mappings[
+                agent_id
+            ] = (
+                self.global_action_mapping
+            )
+
+    # =============================================================
+    # GET ACTION MASK
+    # =============================================================
+
+    def get_action_mask(
         self,
         agent_id,
-        action_class
     ):
-        """
-        Build valid parameters required by a CybORG action.
-        """
 
-        parameters = {}
+        return self.action_masks[
+            agent_id
+        ].copy()
 
-        try:
-            action_space = self.env.get_action_space(
-                agent_id
-            )
-        except Exception:
-            return parameters
-
-        try:
-            signature = inspect.signature(
-                action_class
-            )
-        except (TypeError, ValueError):
-            return parameters
-
-        # ---------------------------------------------------------
-        # Helper: get first valid value
-        # ---------------------------------------------------------
-
-        def first_valid(space):
-
-            if not isinstance(space, dict):
-                return None
-
-            for value, enabled in space.items():
-
-                if enabled:
-                    return value
-
-            return None
-
-        # ---------------------------------------------------------
-        # Get available values
-        # ---------------------------------------------------------
-
-        session = first_valid(
-            action_space.get("session", {})
-        )
-
-        agent = first_valid(
-            action_space.get("agent", {})
-        )
-
-        subnet = first_valid(
-            action_space.get("subnet", {})
-        )
-
-        hostname = first_valid(
-            action_space.get("hostname", {})
-        )
-
-        # ---------------------------------------------------------
-        # For traffic actions
-        #
-        # CybORG requires:
-        #
-        # AllowTrafficZone(
-        #     session,
-        #     agent,
-        #     from_subnet,
-        #     to_subnet
-        # )
-        #
-        # BlockTrafficZone(
-        #     session,
-        #     agent,
-        #     from_subnet,
-        #     to_subnet
-        # )
-        # ---------------------------------------------------------
-
-        if action_class.__name__ in (
-            "AllowTrafficZone",
-            "BlockTrafficZone"
-        ):
-
-            parameters["session"] = (
-                session
-                if session is not None
-                else 0
-            )
-
-            parameters["agent"] = (
-                agent
-                if agent is not None
-                else agent_id
-            )
-
-            # Current available subnet
-            if subnet is not None:
-
-                parameters["from_subnet"] = subnet
-
-                parameters["to_subnet"] = subnet
-
-            return parameters
-
-        # ---------------------------------------------------------
-        # Normal actions
-        # ---------------------------------------------------------
-
-        for parameter_name, parameter in (
-            signature.parameters.items()
-        ):
-
-            if parameter_name == "self":
-                continue
-
-            # Parameter has a default value
-            if (
-                parameter.default
-                is not inspect.Parameter.empty
-            ):
-                continue
-
-            if parameter_name == "session":
-
-                parameters[
-                    "session"
-                ] = (
-                    session
-                    if session is not None
-                    else 0
-                )
-
-            elif parameter_name == "agent":
-
-                parameters[
-                    "agent"
-                ] = (
-                    agent
-                    if agent is not None
-                    else agent_id
-                )
-
-            elif parameter_name == "hostname":
-
-                if hostname is not None:
-
-                    parameters[
-                        "hostname"
-                    ] = hostname
-
-        return parameters
     # =============================================================
-    # Create CybORG action
+    # PRINT ACTION MAPPINGS
+    # =============================================================
+
+    def print_action_mappings(
+        self,
+    ):
+
+        print()
+        print(
+            "===== GLOBAL ACTION MAPPING ====="
+        )
+
+        for index, action in enumerate(
+            self.global_action_mapping
+        ):
+
+            print(
+                f"{index:03d} -> "
+                f"{action}"
+            )
+
+        print()
+
+        print(
+            "Total global actions:",
+            len(
+                self.global_action_mapping
+            ),
+        )
+
+        print()
+
+        print(
+            "===== AGENT ACTION MASKS ====="
+        )
+
+        for agent_id in self.agent_ids:
+
+            mask = (
+                self.action_masks[
+                    agent_id
+                ]
+            )
+
+            valid_count = int(
+                np.sum(mask)
+            )
+
+            invalid_count = int(
+                np.sum(
+                    mask == 0
+                )
+            )
+
+            print(
+                f"{agent_id}: "
+                f"{valid_count}/"
+                f"{self.action_dim} "
+                f"valid actions "
+                f"({invalid_count} invalid)"
+            )
+
+    # =============================================================
+    # CREATE CYBORG ACTION
     # =============================================================
 
     def _create_cyborg_action(
         self,
         agent_id,
-        action_index
+        action_index,
     ):
-        """
-        Convert a discrete MAPPO action index
-        into a real CybORG action object.
-        """
 
-        # Make sure action is valid
-        action_index = int(action_index)
+        # ---------------------------------------------------------
+        # VALIDATE INDEX
+        # ---------------------------------------------------------
 
         if action_index < 0:
+
             action_index = 0
 
-        if action_index >= self.action_dim:
-            action_index = self.action_dim - 1
+        if (
+            action_index
+            >= self.action_dim
+        ):
 
-        action_name = (
-            self.ACTION_NAMES[
+            action_index = 0
+
+        # ---------------------------------------------------------
+        # VALIDATE MASK
+        # ---------------------------------------------------------
+
+        mask = (
+            self.action_masks.get(
+                agent_id
+            )
+        )
+
+        if mask is None:
+
+            action_index = 0
+
+        elif (
+            mask[action_index]
+            == 0
+        ):
+
+            action_index = 0
+
+        # ---------------------------------------------------------
+        # GET MAPPING
+        # ---------------------------------------------------------
+
+        mapping = (
+            self.global_action_mapping[
                 action_index
             ]
         )
 
-        # ---------------------------------------------------------
-        # Find actual CybORG action class
-        # ---------------------------------------------------------
-
-        action_class = self._find_action_class(
-            agent_id,
-            action_name
+        action_name = (
+            mapping[
+                "action_name"
+            ]
         )
 
         # ---------------------------------------------------------
-        # If unavailable -> Sleep
+        # SLEEP
         # ---------------------------------------------------------
+
+        if action_name == "Sleep":
+
+            action_class = (
+                self._find_action_class(
+                    "Sleep"
+                )
+            )
+
+            return action_class()
+
+        # ---------------------------------------------------------
+        # PARAMETERS
+        # ---------------------------------------------------------
+
+        parameters = {
+            key: value
+            for key, value in mapping.items()
+            if key != "action_name"
+        }
+
+        # ---------------------------------------------------------
+        # FIND ACTION CLASS
+        # ---------------------------------------------------------
+
+        action_class = (
+            self._find_action_class(
+                action_name
+            )
+        )
 
         if action_class is None:
 
-            sleep_class = self._find_action_class(
-                agent_id,
-                "Sleep"
+            sleep_class = (
+                self._find_action_class(
+                    "Sleep"
+                )
             )
 
-            if sleep_class is not None:
-
-                try:
-                    return sleep_class()
-                except Exception:
-                    pass
-
-            return None
+            return sleep_class()
 
         # ---------------------------------------------------------
-        # Build parameters
-        # ---------------------------------------------------------
-
-        action_parameters = (
-            self._build_action_parameters(
-                agent_id,
-                action_class
-            )
-        )
-
-        # ---------------------------------------------------------
-        # Create action
+        # CREATE ACTION
         # ---------------------------------------------------------
 
         try:
 
             return action_class(
-                **action_parameters
+                **parameters
             )
 
         except Exception:
 
-            # If parameter construction fails,
-            # use Sleep instead.
-            sleep_class = self._find_action_class(
-                agent_id,
-                "Sleep"
+            sleep_class = (
+                self._find_action_class(
+                    "Sleep"
+                )
             )
 
-            if sleep_class is not None:
-
-                try:
-                    return sleep_class()
-                except Exception:
-                    pass
-
-            return None
+            return sleep_class()
 
     # =============================================================
-    # Reward processing
+    # POSITIVE REWARD
     # =============================================================
 
-    def _process_reward(self, reward):
-        """
-        Convert CybORG reward output into a single float.
-        """
+    def _process_reward(
+        self,
+        reward,
+    ):
 
-        # Direct number
+        raw_reward = 0.0
+
+        # ---------------------------------------------------------
+        # NUMERIC
+        # ---------------------------------------------------------
+
         if isinstance(
             reward,
-            (int, float, np.integer, np.floating)
+            (
+                int,
+                float,
+                np.integer,
+                np.floating,
+            ),
         ):
 
-            return float(reward)
+            raw_reward = float(
+                reward
+            )
 
-        # Dictionary of reward components
-        if isinstance(
+        # ---------------------------------------------------------
+        # DICTIONARY
+        # ---------------------------------------------------------
+
+        elif isinstance(
             reward,
-            dict
+            dict,
         ):
 
-            total = 0.0
-
-            for value in reward.values():
+            for value in (
+                reward.values()
+            ):
 
                 if isinstance(
                     value,
-                    (int, float, np.integer, np.floating)
+                    (
+                        int,
+                        float,
+                        np.integer,
+                        np.floating,
+                    ),
                 ):
 
-                    total += float(value)
-
-            return total
-
-        return 0.0
-
-    # =============================================================
-    # Step
-    # =============================================================
-
-    def step(self, actions):
-        """
-        Execute one multi-agent step.
-
-        Input:
-            actions = {
-                "blue_agent_0": 3,
-                "blue_agent_1": 7,
-                ...
-            }
-
-        Output:
-            observations
-            rewards
-            terminated
-            info
-        """
+                    raw_reward += float(
+                        value
+                    )
 
         # ---------------------------------------------------------
-        # Convert MAPPO actions into CybORG actions
+        # SCALE
         # ---------------------------------------------------------
+
+        scaled_reward = (
+            raw_reward / 5.0
+        )
+
+        # ---------------------------------------------------------
+        # SOFTPLUS
+        # ---------------------------------------------------------
+
+        if scaled_reward > 20:
+
+            positive_reward = (
+                scaled_reward
+            )
+
+        else:
+
+            positive_reward = (
+                np.log1p(
+                    np.exp(
+                        scaled_reward
+                    )
+                )
+            )
+
+        # ---------------------------------------------------------
+        # GUARANTEE POSITIVE
+        # ---------------------------------------------------------
+
+        positive_reward += 0.01
+
+        return float(
+            positive_reward
+        )
+
+    # =============================================================
+    # STEP
+    # =============================================================
+
+    def step(
+        self,
+        actions,
+    ):
+        """
+        Execute one CybORG environment step.
+
+        Supports both possible CybORG return formats:
+
+        1. Result object:
+
+            results.observation
+            results.reward
+            results.done
+            results.info
+
+        2. Tuple:
+
+            (
+                observations,
+                rewards,
+                done,
+                info
+            )
+        """
+
+        # =========================================================
+        # CONVERT MAPPO ACTIONS
+        # =========================================================
 
         cyborg_actions = {}
 
@@ -654,157 +1163,279 @@ class CybORGMAPPOEnv:
 
             action_index = actions.get(
                 agent_id,
-                7
+                0,
             )
 
-            action = self._create_cyborg_action(
+            cyborg_actions[
+                agent_id
+            ] = self._create_cyborg_action(
                 agent_id,
-                action_index
+                int(
+                    action_index
+                ),
             )
 
-            if action is not None:
+        # =========================================================
+        # EXECUTE CYBORG
+        # =========================================================
 
-                cyborg_actions[
-                    agent_id
-                ] = action
-
-        # ---------------------------------------------------------
-        # Execute CybORG step
-        # ---------------------------------------------------------
-
-        result = self.env.parallel_step(
+        results = self.env.parallel_step(
             actions=cyborg_actions
         )
 
-        # ---------------------------------------------------------
-        # Handle CybORG result
-        # ---------------------------------------------------------
+        # =========================================================
+        # NORMALIZE RESULT
+        # =========================================================
 
-        if isinstance(result, tuple):
+        if isinstance(
+            results,
+            tuple,
+        ):
 
-            if len(result) == 4:
+            # -----------------------------------------------------
+            # TUPLE RETURN
+            # -----------------------------------------------------
 
-                raw_observations, raw_rewards, dones, infos = result
+            if len(results) == 4:
 
-            elif len(result) == 3:
+                raw_observations = (
+                    results[0]
+                )
 
-                raw_observations, raw_rewards, dones = result
-                infos = {}
+                raw_rewards = (
+                    results[1]
+                )
+
+                raw_done = (
+                    results[2]
+                )
+
+                raw_infos = (
+                    results[3]
+                )
+
+            elif len(results) == 3:
+
+                raw_observations = (
+                    results[0]
+                )
+
+                raw_rewards = (
+                    results[1]
+                )
+
+                raw_done = (
+                    results[2]
+                )
+
+                raw_infos = {}
 
             else:
 
-                raw_observations = result[0]
-                raw_rewards = result[1]
-                dones = result[2]
-                infos = {}
+                raise RuntimeError(
+                    "Unexpected CybORG "
+                    "parallel_step() result. "
+                    f"Expected 3 or 4 values, "
+                    f"got {len(results)}."
+                )
 
         else:
 
-            raw_observations = {}
-            raw_rewards = {}
-            dones = False
-            infos = {}
+            # -----------------------------------------------------
+            # RESULT OBJECT
+            # -----------------------------------------------------
 
-        # ---------------------------------------------------------
-        # Process observations
-        # ---------------------------------------------------------
+            raw_observations = getattr(
+                results,
+                "observation",
+                {},
+            )
+
+            raw_rewards = getattr(
+                results,
+                "reward",
+                {},
+            )
+
+            raw_done = getattr(
+                results,
+                "done",
+                False,
+            )
+
+            raw_infos = getattr(
+                results,
+                "info",
+                {},
+            )
+
+        # =========================================================
+        # OBSERVATIONS
+        # =========================================================
 
         observations = {}
 
         for agent_id in self.agent_ids:
 
-            if agent_id in raw_observations:
+            if (
+                isinstance(
+                    raw_observations,
+                    dict,
+                )
+                and agent_id
+                in raw_observations
+            ):
 
-                observations[agent_id] = (
-                    self._process_observation(
-                        raw_observations[
-                            agent_id
-                        ]
-                    )
+                observations[
+                    agent_id
+                ] = self._process_observation(
+                    raw_observations[
+                        agent_id
+                    ]
                 )
 
             else:
 
-                observations[agent_id] = np.zeros(
+                observations[
+                    agent_id
+                ] = np.zeros(
                     self.observation_dim,
-                    dtype=np.float32
+                    dtype=np.float32,
                 )
 
-        # ---------------------------------------------------------
-        # Process rewards
-        # ---------------------------------------------------------
+        # =========================================================
+        # REWARDS
+        # =========================================================
 
         rewards = {}
 
         for agent_id in self.agent_ids:
 
-            if isinstance(
-                raw_rewards,
-                dict
+            raw_reward = 0.0
+
+            if (
+                isinstance(
+                    raw_rewards,
+                    dict,
+                )
+                and agent_id
+                in raw_rewards
             ):
 
-                rewards[agent_id] = (
-                    self._process_reward(
-                        raw_rewards.get(
-                            agent_id,
-                            0.0
-                        )
-                    )
+                raw_reward = (
+                    raw_rewards[
+                        agent_id
+                    ]
                 )
 
-            else:
+            rewards[
+                agent_id
+            ] = self._process_reward(
+                raw_reward
+            )
 
-                rewards[agent_id] = (
-                    self._process_reward(
-                        raw_rewards
-                    )
-                )
+        # =========================================================
+        # TERMINATION
+        # =========================================================
 
-        # ---------------------------------------------------------
-        # Process termination
-        # ---------------------------------------------------------
+        terminated = False
 
         if isinstance(
-            dones,
-            dict
+            raw_done,
+            dict,
         ):
 
             terminated = any(
                 bool(value)
-                for value in dones.values()
+                for value
+                in raw_done.values()
             )
 
         else:
 
             terminated = bool(
-                dones
+                raw_done
             )
+
+        # =========================================================
+        # INFO
+        # =========================================================
+
+        infos = {}
+
+        for agent_id in self.agent_ids:
+
+            original_info = {}
+
+            if (
+                isinstance(
+                    raw_infos,
+                    dict,
+                )
+                and agent_id
+                in raw_infos
+            ):
+
+                if isinstance(
+                    raw_infos[
+                        agent_id
+                    ],
+                    dict,
+                ):
+
+                    original_info = (
+                        raw_infos[
+                            agent_id
+                        ].copy()
+                    )
+
+            # -----------------------------------------------------
+            # Add action mask
+            # -----------------------------------------------------
+
+            original_info[
+                "action_mask"
+            ] = self.action_masks[
+                agent_id
+            ].copy()
+
+            infos[
+                agent_id
+            ] = original_info
+
+        # =========================================================
+        # RETURN
+        # =========================================================
 
         return (
             observations,
             rewards,
             terminated,
-            infos
+            infos,
         )
 
     # =============================================================
-    # Close
+    # CLOSE
     # =============================================================
 
-    def close(self, **kwargs):
-        """
-        CybORG CC4 environment does not require GUI cleanup.
-        """
+    def close(self):
 
-        return
+        try:
+
+            self.env.close()
+
+        except Exception:
+
+            pass
 
 
-# =============================================================
-# Direct test
-# =============================================================
+# =================================================================
+# TEST ENVIRONMENT
+# =================================================================
 
 if __name__ == "__main__":
 
+    print()
     print(
         "===== CybORG MAPPO ENV TEST ====="
     )
@@ -813,41 +1444,183 @@ if __name__ == "__main__":
         steps=10
     )
 
+    # -------------------------------------------------------------
+    # BASIC INFORMATION
+    # -------------------------------------------------------------
+
     print(
-        "Agents:",
-        env.get_agent_ids()
+        f"Agents: "
+        f"{env.agent_ids}"
     )
 
     print(
-        "Number of agents:",
-        env.get_num_agents()
+        f"Number of agents: "
+        f"{len(env.agent_ids)}"
     )
 
     print(
-        "Observation dimension:",
-        env.get_observation_dim()
+        f"Observation dimension: "
+        f"{env.observation_dim}"
     )
 
     print(
-        "Action dimension:",
-        env.get_action_dim()
+        f"Global action dimension: "
+        f"{env.action_dim}"
     )
 
-    observations = env.reset()
+    # -------------------------------------------------------------
+    # ACTION MAPPING
+    # -------------------------------------------------------------
 
+    env.print_action_mappings()
+
+    # -------------------------------------------------------------
+    # ACTION MASK TEST
+    # -------------------------------------------------------------
+
+    print()
     print(
-        "\nObservation shapes:"
+        "===== ACTION MASK TEST ====="
     )
 
-    for agent_id in env.get_agent_ids():
+    for agent_id in env.agent_ids:
+
+        mask = (
+            env.get_action_mask(
+                agent_id
+            )
+        )
+
+        valid_count = int(
+            np.sum(mask)
+        )
+
+        invalid_count = int(
+            np.sum(
+                mask == 0
+            )
+        )
+
+        print(
+            f"{agent_id}: "
+            f"shape={mask.shape}, "
+            f"valid={valid_count}, "
+            f"invalid={invalid_count}"
+        )
+
+    # -------------------------------------------------------------
+    # RESET
+    # -------------------------------------------------------------
+
+    observations = (
+        env.reset()
+    )
+
+    print()
+    print(
+        "Observation shapes:"
+    )
+
+    for agent_id in env.agent_ids:
 
         print(
             agent_id,
             observations[
                 agent_id
-            ].shape
+            ].shape,
         )
 
-    print(
-        "\n===== ENV TEST PASSED ====="
+    # -------------------------------------------------------------
+    # BASIC ASSERTIONS
+    # -------------------------------------------------------------
+
+    assert (
+        env.action_dim
+        == len(
+            env.global_action_mapping
+        )
     )
+
+    assert (
+        env.action_dim > 0
+    )
+
+    for agent_id in env.agent_ids:
+
+        assert (
+            agent_id
+            in env.action_masks
+        )
+
+        assert (
+            len(
+                env.action_masks[
+                    agent_id
+                ]
+            )
+            == env.action_dim
+        )
+
+        assert (
+            np.sum(
+                env.action_masks[
+                    agent_id
+                ]
+            )
+            >= 1
+        )
+
+    # -------------------------------------------------------------
+    # EXACTLY ONE SLEEP
+    # -------------------------------------------------------------
+
+    sleep_indices = [
+        index
+        for index, action
+        in enumerate(
+            env.global_action_mapping
+        )
+        if (
+            action[
+                "action_name"
+            ]
+            == "Sleep"
+        )
+    ]
+
+    assert (
+        len(
+            sleep_indices
+        )
+        == 1
+    )
+
+    sleep_index = (
+        sleep_indices[0]
+    )
+
+    # -------------------------------------------------------------
+    # SLEEP MUST BE VALID
+    # -------------------------------------------------------------
+
+    for agent_id in env.agent_ids:
+
+        assert (
+            env.action_masks[
+                agent_id
+            ][sleep_index]
+            == 1.0
+        )
+
+    print()
+    print(
+        f"Unique Sleep action index: "
+        f"{sleep_index}"
+    )
+
+    print()
+    print(
+        "===== ENV TEST PASSED ====="
+    )
+
+    env.close()
