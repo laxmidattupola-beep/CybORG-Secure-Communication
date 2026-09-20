@@ -115,27 +115,26 @@ class Message:
 
 class CommunicationLayer:
 
-  def __init__(
-    self,
-    agent_id: str = None,
-    agent_ids: List[str] = None,
-    trust_manager: TrustManager = None,
-    shared_secret: bytes = b"secure-cyborg-secret"
-):
-    self.agent_id = agent_id
-    self.agent_ids = agent_ids or []
-    self.trust_manager = trust_manager or TrustManager()
-    self.shared_secret = shared_secret
+    def __init__(
+        self,
+        agent_id: str,
+        agent_ids: List[str],
+        trust_manager: TrustManager,
+        shared_secret: bytes
+    ):
 
-    self.inbox: List[Message] = []
-    self.outbox: List[Message] = []
+        self.agent_id = agent_id
+        self.agent_ids = agent_ids
+        self.trust_manager = trust_manager
+        self.shared_secret = shared_secret
 
-       
+        self.inbox: List[Message] = []
+        self.outbox: List[Message] = []
 
-    self.sequence_number = 0
+        self.sequence_number = 0
 
         # Store processed message IDs
-    self.processed_message_ids = set()
+        self.processed_message_ids = set()
 
     # ========================================================
     # CREATE HMAC
