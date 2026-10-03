@@ -3,17 +3,17 @@ import torch.nn as nn
 from torch.distributions import Categorical
 
 
-# ================================================================
-# ACTOR
-# ================================================================
+# ============================================================
+# Actor Network
+# ============================================================
 
 class Actor(nn.Module):
 
     def __init__(
         self,
         observation_dim,
-        action_dim=352,
-        hidden_dim=128,
+        action_dim=8,
+        hidden_dim=128
     ):
 
         super().__init__()
@@ -22,165 +22,86 @@ class Actor(nn.Module):
 
             nn.Linear(
                 observation_dim,
-                hidden_dim,
+                hidden_dim
             ),
 
             nn.ReLU(),
 
             nn.Linear(
                 hidden_dim,
-                hidden_dim,
+                hidden_dim
             ),
 
             nn.ReLU(),
 
             nn.Linear(
                 hidden_dim,
-                action_dim,
-            ),
+                action_dim
+            )
         )
-
-    # ============================================================
-    # FORWARD
-    # ============================================================
 
     def forward(
         self,
-        observation,
+        observation
     ):
 
         return self.network(
             observation
         )
 
-    # ============================================================
-    # APPLY ACTION MASK
-    # ============================================================
-
-    def apply_action_mask(
-        self,
-        logits,
-        action_mask,
-    ):
-        """
-        Prevent invalid CybORG actions from
-        being selected.
-
-        action_mask:
-
-            1 -> valid action
-            0 -> invalid action
-
-        Invalid actions receive a very large
-        negative logit so their probability
-        becomes approximately zero.
-        """
-
-        if action_mask is None:
-
-            return logits
-
-        # Make sure mask is a tensor
-
-        if not torch.is_tensor(
-            action_mask
-        ):
-
-            action_mask = torch.tensor(
-                action_mask,
-                dtype=torch.float32,
-                device=logits.device,
-            )
-
-        else:
-
-            action_mask = action_mask.to(
-                device=logits.device,
-                dtype=torch.float32,
-            )
-
-        # --------------------------------------------------------
-        # Handle single observation
-        # --------------------------------------------------------
-
-        if logits.dim() == 1:
-
-            if action_mask.dim() > 1:
-
-                action_mask = (
-                    action_mask.squeeze(0)
-                )
-
-        # --------------------------------------------------------
-        # Handle batch
-        # --------------------------------------------------------
-
-        else:
-
-            if action_mask.dim() == 1:
-
-                action_mask = (
-                    action_mask.unsqueeze(0)
-                )
-
-        # --------------------------------------------------------
-        # Invalid actions -> huge negative value
-        # --------------------------------------------------------
-
-        masked_logits = logits.masked_fill(
-            action_mask <= 0,
-            -1e9,
-        )
-
-        return masked_logits
-
-    # ============================================================
-    # GET DISTRIBUTION
-    # ============================================================
-
     def get_distribution(
         self,
         observation,
-        action_mask=None,
+        action_mask=None
     ):
 
         logits = self.forward(
             observation
         )
 
-        logits = self.apply_action_mask(
-            logits,
-            action_mask,
-        )
+        # --------------------------------------------------------
+        # Apply action mask
+        # --------------------------------------------------------
+
+        if action_mask is not None:
+
+            # 0 = unavailable
+            # 1 = available
+            invalid_actions = (
+                action_mask <= 0
+            )
+
+            logits = logits.masked_fill(
+                invalid_actions,
+                -1e9
+            )
 
         return Categorical(
             logits=logits
         )
 
-    # ============================================================
-    # SAMPLE ACTION
-    # ============================================================
-
     def get_action(
         self,
         observation,
         action_mask=None,
+        deterministic=False
     ):
-        """
-        Sample an action only from valid
-        CybORG actions.
-        """
 
-        distribution = (
-            self.get_distribution(
-                observation,
-                action_mask,
+        distribution = self.get_distribution(
+            observation,
+            action_mask
+        )
+
+        if deterministic:
+
+            action = torch.argmax(
+                distribution.logits,
+                dim=-1
             )
-        )
 
-        action = (
-            distribution.sample()
-        )
+        else:
+
+            action = distribution.sample()
 
         log_probability = (
             distribution.log_prob(
@@ -190,66 +111,13 @@ class Actor(nn.Module):
 
         return (
             action,
-            log_probability,
+            log_probability
         )
 
-    # ============================================================
-    # LOG PROBABILITY
-    # ============================================================
 
-    def get_log_probability(
-        self,
-        observation,
-        action,
-        action_mask=None,
-    ):
-        """
-        Calculate log probability of an
-        already-selected action.
-
-        IMPORTANT:
-
-        The same action mask used during
-        action selection must also be used
-        during PPO updates.
-        """
-
-        distribution = (
-            self.get_distribution(
-                observation,
-                action_mask,
-            )
-        )
-
-        return (
-            distribution.log_prob(
-                action
-            )
-        )
-
-    # ============================================================
-    # ENTROPY
-    # ============================================================
-
-    def get_entropy(
-        self,
-        observation,
-        action_mask=None,
-    ):
-
-        distribution = (
-            self.get_distribution(
-                observation,
-                action_mask,
-            )
-        )
-
-        return distribution.entropy()
-
-
-# ================================================================
-# CENTRALIZED CRITIC
-# ================================================================
+# ============================================================
+# Centralized Critic
+# ============================================================
 
 class CentralizedCritic(nn.Module):
 
@@ -257,7 +125,7 @@ class CentralizedCritic(nn.Module):
         self,
         observation_dim,
         num_agents=5,
-        hidden_dim=128,
+        hidden_dim=128
     ):
 
         super().__init__()
@@ -271,66 +139,58 @@ class CentralizedCritic(nn.Module):
 
             nn.Linear(
                 input_dim,
-                hidden_dim,
+                hidden_dim
             ),
 
             nn.ReLU(),
 
             nn.Linear(
                 hidden_dim,
-                hidden_dim,
+                hidden_dim
             ),
 
             nn.ReLU(),
 
             nn.Linear(
                 hidden_dim,
-                1,
-            ),
+                1
+            )
         )
-
-    # ============================================================
-    # FORWARD
-    # ============================================================
 
     def forward(
         self,
-        observations,
+        observations
     ):
 
         batch_size = (
             observations.shape[0]
         )
 
-        observations = (
-            observations.reshape(
-                batch_size,
-                -1,
-            )
+        observations = observations.reshape(
+            batch_size,
+            -1
         )
 
         value = self.network(
             observations
         )
 
-        return value.squeeze(
-            -1
-        )
+        return value.squeeze(-1)
 
 
-# ================================================================
+# ============================================================
 # MAPPO
-# ================================================================
+# ============================================================
 
 class MAPPO:
 
     def __init__(
         self,
         observation_dim,
-        action_dim=352,
+        action_dim=8,
         num_agents=5,
         hidden_dim=128,
-        learning_rate=3e-4,
+        device=None
     ):
 
         self.observation_dim = (
@@ -346,200 +206,708 @@ class MAPPO:
         )
 
         # --------------------------------------------------------
-        # ACTORS
+        # Device
+        # --------------------------------------------------------
+
+        if device is None:
+
+            self.device = torch.device(
+                "cuda"
+                if torch.cuda.is_available()
+                else "cpu"
+            )
+
+        else:
+
+            self.device = torch.device(
+                device
+            )
+
+        # --------------------------------------------------------
+        # One independent actor per agent
         # --------------------------------------------------------
 
         self.actors = [
 
             Actor(
-                observation_dim=(
-                    observation_dim
-                ),
+                observation_dim=observation_dim,
+                action_dim=action_dim,
+                hidden_dim=hidden_dim
+            ).to(self.device)
 
-                action_dim=(
-                    action_dim
-                ),
-
-                hidden_dim=(
-                    hidden_dim
-                ),
-            )
-
-            for _ in range(
-                num_agents
-            )
+            for _ in range(num_agents)
         ]
 
         # --------------------------------------------------------
-        # CENTRALIZED CRITIC
+        # Centralized critic
         # --------------------------------------------------------
 
-        self.critic = (
-            CentralizedCritic(
-                observation_dim=(
-                    observation_dim
-                ),
+        self.critic = CentralizedCritic(
 
-                num_agents=(
-                    num_agents
-                ),
+            observation_dim=observation_dim,
 
-                hidden_dim=(
-                    hidden_dim
-                ),
-            )
-        )
+            num_agents=num_agents,
 
-        # --------------------------------------------------------
-        # ACTOR OPTIMIZERS
-        # --------------------------------------------------------
+            hidden_dim=hidden_dim
 
-        self.actor_optimizers = [
-
-            torch.optim.Adam(
-                actor.parameters(),
-                lr=learning_rate,
-            )
-
-            for actor in self.actors
-        ]
-
-        # --------------------------------------------------------
-        # CRITIC OPTIMIZER
-        # --------------------------------------------------------
-
-        self.critic_optimizer = (
-            torch.optim.Adam(
-                self.critic.parameters(),
-                lr=learning_rate,
-            )
-        )
+        ).to(self.device)
 
     # ============================================================
-    # SELECT ACTIONS
+    # Action selection
     # ============================================================
 
+    @torch.no_grad()
     def select_actions(
         self,
         observations,
-        action_masks,
+        action_masks=None,
+        deterministic=True
     ):
         """
-        Select one action for every
-        Blue agent.
+        Select one action for every agent.
 
+        Parameters
+        ----------
         observations:
-            {
-                "blue_agent_0": np.array,
-                ...
-            }
+            Dictionary:
+
+                {
+                    "blue_agent_0": observation,
+                    "blue_agent_1": observation,
+                    ...
+                }
+
+            OR a tensor of shape:
+
+                [num_agents, observation_dim]
 
         action_masks:
-            {
-                "blue_agent_0": np.array,
-                ...
-            }
+            Dictionary:
 
-        Returns:
+                {
+                    "blue_agent_0": mask,
+                    ...
+                }
 
-            actions
-            log_probabilities
+            where 1 = valid and 0 = invalid.
+
+        deterministic:
+            If True, select the highest-probability action.
+            If False, sample from the policy.
+
+        Returns
+        -------
+        actions:
+            Dictionary mapping agent IDs to integer actions.
         """
+
+        # --------------------------------------------------------
+        # Dictionary input
+        # --------------------------------------------------------
+
+        if isinstance(
+            observations,
+            dict
+        ):
+
+            agent_ids = list(
+                observations.keys()
+            )
+
+            observation_list = []
+
+            for agent_id in agent_ids:
+
+                observation_list.append(
+                    observations[agent_id]
+                )
+
+        # --------------------------------------------------------
+        # Tensor input
+        # --------------------------------------------------------
+
+        else:
+
+            agent_ids = [
+                f"blue_agent_{i}"
+                for i in range(
+                    self.num_agents
+                )
+            ]
+
+            observation_list = observations
+
+        # --------------------------------------------------------
+        # Convert observations to tensor
+        # --------------------------------------------------------
+
+        if isinstance(
+            observation_list,
+            torch.Tensor
+        ):
+
+            observation_tensor = (
+                observation_list.to(
+                    self.device,
+                    dtype=torch.float32
+                )
+            )
+
+        else:
+
+            observation_tensor = torch.tensor(
+                observation_list,
+                dtype=torch.float32,
+                device=self.device
+            )
+
+        # Make sure shape is:
+        #
+        # [num_agents, observation_dim]
+
+        if observation_tensor.dim() == 1:
+
+            observation_tensor = (
+                observation_tensor.unsqueeze(0)
+            )
+
+        # --------------------------------------------------------
+        # Select actions
+        # --------------------------------------------------------
 
         actions = {}
 
-        log_probabilities = {}
-
-        # --------------------------------------------------------
-        # AGENT ORDER
-        # --------------------------------------------------------
-
-        agent_ids = list(
-            observations.keys()
-        )
-
-        # --------------------------------------------------------
-        # SELECT ACTION FOR EACH AGENT
-        # --------------------------------------------------------
-
-        for index, agent_id in enumerate(
+        for i, agent_id in enumerate(
             agent_ids
         ):
 
             observation = (
-                observations[
-                    agent_id
-                ]
-            )
-
-            action_mask = (
-                action_masks[
-                    agent_id
-                ]
+                observation_tensor[i]
+                .unsqueeze(0)
             )
 
             # ----------------------------------------------------
-            # Convert observation
+            # Get action mask
             # ----------------------------------------------------
 
-            if not torch.is_tensor(
-                observation
+            action_mask = None
+
+            if action_masks is not None:
+
+                if isinstance(
+                    action_masks,
+                    dict
+                ):
+
+                    action_mask = (
+                        action_masks.get(
+                            agent_id
+                        )
+                    )
+
+                elif isinstance(
+                    action_masks,
+                    torch.Tensor
+                ):
+
+                    action_mask = (
+                        action_masks[i]
+                    )
+
+            # ----------------------------------------------------
+            # Convert mask to tensor
+            # ----------------------------------------------------
+
+            if action_mask is not None:
+
+                if not isinstance(
+                    action_mask,
+                    torch.Tensor
+                ):
+
+                    action_mask = torch.tensor(
+                        action_mask,
+                        dtype=torch.float32,
+                        device=self.device
+                    )
+
+                else:
+
+                    action_mask = (
+                        action_mask.to(
+                            self.device,
+                            dtype=torch.float32
+                        )
+                    )
+
+                if action_mask.dim() == 1:
+
+                    action_mask = (
+                        action_mask.unsqueeze(0)
+                    )
+
+            # ----------------------------------------------------
+            # Get action
+            # ----------------------------------------------------
+
+            action, _ = self.actors[i].get_action(
+
+                observation,
+
+                action_mask=action_mask,
+
+                deterministic=deterministic
+
+            )
+
+            actions[agent_id] = (
+                int(action.item())
+            )
+
+        return actions
+
+    # ============================================================
+    # Evaluate actions
+    # ============================================================
+
+    @torch.no_grad()
+    def evaluate_actions(
+        self,
+        observations,
+        actions,
+        action_masks=None
+    ):
+        """
+        Evaluate log probabilities and entropy
+        for selected actions.
+        """
+
+        if isinstance(
+            observations,
+            dict
+        ):
+
+            agent_ids = list(
+                observations.keys()
+            )
+
+            observation_list = [
+                observations[agent_id]
+                for agent_id in agent_ids
+            ]
+
+        else:
+
+            agent_ids = [
+                f"blue_agent_{i}"
+                for i in range(
+                    self.num_agents
+                )
+            ]
+
+            observation_list = observations
+
+        observation_tensor = torch.tensor(
+            observation_list,
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        if observation_tensor.dim() == 1:
+
+            observation_tensor = (
+                observation_tensor.unsqueeze(0)
+            )
+
+        log_probabilities = []
+        entropies = []
+
+        for i, agent_id in enumerate(
+            agent_ids
+        ):
+
+            observation = (
+                observation_tensor[i]
+                .unsqueeze(0)
+            )
+
+            action_mask = None
+
+            if action_masks is not None:
+
+                if isinstance(
+                    action_masks,
+                    dict
+                ):
+
+                    action_mask = (
+                        action_masks.get(
+                            agent_id
+                        )
+                    )
+
+                else:
+
+                    action_mask = (
+                        action_masks[i]
+                    )
+
+                if action_mask is not None:
+
+                    action_mask = torch.tensor(
+                        action_mask,
+                        dtype=torch.float32,
+                        device=self.device
+                    )
+
+                    if action_mask.dim() == 1:
+
+                        action_mask = (
+                            action_mask.unsqueeze(0)
+                        )
+
+            distribution = (
+                self.actors[i].get_distribution(
+                    observation,
+                    action_mask
+                )
+            )
+
+            if isinstance(
+                actions,
+                dict
             ):
 
-                observation = torch.tensor(
-                    observation,
-                    dtype=torch.float32,
+                action = actions[
+                    agent_id
+                ]
+
+            else:
+
+                action = actions[i]
+
+            if not isinstance(
+                action,
+                torch.Tensor
+            ):
+
+                action = torch.tensor(
+                    [action],
+                    dtype=torch.long,
+                    device=self.device
                 )
 
             else:
 
-                observation = observation.float()
-
-            # ----------------------------------------------------
-            # Convert mask
-            # ----------------------------------------------------
-
-            if not torch.is_tensor(
-                action_mask
-            ):
-
-                action_mask = torch.tensor(
-                    action_mask,
-                    dtype=torch.float32,
+                action = action.to(
+                    self.device,
+                    dtype=torch.long
                 )
 
-            # ----------------------------------------------------
-            # Actor
-            # ----------------------------------------------------
+                if action.dim() == 0:
 
-            actor = self.actors[
-                index
-            ]
+                    action = action.unsqueeze(0)
 
-            # ----------------------------------------------------
-            # Sample action
-            # ----------------------------------------------------
-
-            action, log_probability = (
-                actor.get_action(
-                    observation,
-                    action_mask,
+            log_probabilities.append(
+                distribution.log_prob(
+                    action
                 )
             )
 
-            actions[
-                agent_id
-            ] = int(
-                action.item()
-            )
-
-            log_probabilities[
-                agent_id
-            ] = float(
-                log_probability.item()
+            entropies.append(
+                distribution.entropy()
             )
 
         return (
-            actions,
-            log_probabilities,
+            torch.cat(
+                log_probabilities
+            ),
+            torch.cat(
+                entropies
+            )
         )
+
+    # ============================================================
+    # Value estimation
+    # ============================================================
+
+    @torch.no_grad()
+    def get_value(
+        self,
+        observations
+    ):
+
+        if isinstance(
+            observations,
+            dict
+        ):
+
+            observation_list = [
+                observations[agent_id]
+                for agent_id in
+                observations.keys()
+            ]
+
+        else:
+
+            observation_list = observations
+
+        observations_tensor = torch.tensor(
+            observation_list,
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        if observations_tensor.dim() == 2:
+
+            observations_tensor = (
+                observations_tensor.unsqueeze(0)
+            )
+
+        return self.critic(
+            observations_tensor
+        )
+
+    # ============================================================
+    # Save model
+    # ============================================================
+
+    def save(
+        self,
+        path
+    ):
+
+        checkpoint = {
+
+            "observation_dim":
+                self.observation_dim,
+
+            "action_dim":
+                self.action_dim,
+
+            "num_agents":
+                self.num_agents,
+
+            "actors": [
+                actor.state_dict()
+                for actor in self.actors
+            ],
+
+            "critic":
+                self.critic.state_dict()
+        }
+
+        torch.save(
+            checkpoint,
+            path
+        )
+
+    # ============================================================
+    # Load model
+    # ============================================================
+
+    def load(
+        self,
+        path,
+        map_location=None
+    ):
+
+        if map_location is None:
+
+            map_location = self.device
+
+        checkpoint = torch.load(
+            path,
+            map_location=map_location
+        )
+
+        # --------------------------------------------------------
+        # Load actors
+        # --------------------------------------------------------
+
+        if "actors" in checkpoint:
+
+            for i, state_dict in enumerate(
+                checkpoint["actors"]
+            ):
+
+                if i < len(
+                    self.actors
+                ):
+
+                    self.actors[i].load_state_dict(
+                        state_dict
+                    )
+
+        # --------------------------------------------------------
+        # Load critic
+        # --------------------------------------------------------
+
+        if "critic" in checkpoint:
+
+            self.critic.load_state_dict(
+                checkpoint["critic"]
+            )
+
+        # --------------------------------------------------------
+        # Evaluation mode
+        # --------------------------------------------------------
+
+        for actor in self.actors:
+
+            actor.eval()
+
+        self.critic.eval()
+
+        return self
+
+
+# ============================================================
+# Model Test
+# ============================================================
+
+if __name__ == "__main__":
+
+    print(
+        "===== MAPPO MODEL TEST ====="
+    )
+
+    observation_dim = 256
+
+    action_dim = 8
+
+    num_agents = 5
+
+    model = MAPPO(
+
+        observation_dim=observation_dim,
+
+        action_dim=action_dim,
+
+        num_agents=num_agents
+    )
+
+    print(
+        "Number of agents:",
+        model.num_agents
+    )
+
+    print(
+        "Observation dimension:",
+        model.observation_dim
+    )
+
+    print(
+        "Action dimension:",
+        model.action_dim
+    )
+
+    print(
+        "Device:",
+        model.device
+    )
+
+    observations = torch.randn(
+        num_agents,
+        observation_dim
+    )
+
+    # ---------------------------------------------------------
+    # Test individual actors
+    # ---------------------------------------------------------
+
+    print(
+        "\nTesting actors..."
+    )
+
+    for i, actor in enumerate(
+        model.actors
+    ):
+
+        observation = (
+            observations[i]
+            .unsqueeze(0)
+            .to(model.device)
+        )
+
+        action, log_probability = (
+            actor.get_action(
+                observation
+            )
+        )
+
+        print(
+            f"Agent {i}: "
+            f"action={action.item()}, "
+            f"log_prob="
+            f"{log_probability.item():.4f}"
+        )
+
+    # ---------------------------------------------------------
+    # Test centralized critic
+    # ---------------------------------------------------------
+
+    print(
+        "\nTesting centralized critic..."
+    )
+
+    centralized_observations = (
+        observations
+        .unsqueeze(0)
+        .to(model.device)
+    )
+
+    value = model.critic(
+        centralized_observations
+    )
+
+    print(
+        "Global state value:",
+        value.item()
+    )
+
+    # ---------------------------------------------------------
+    # Test select_actions
+    # ---------------------------------------------------------
+
+    print(
+        "\nTesting select_actions..."
+    )
+
+    observation_dict = {
+
+        f"blue_agent_{i}":
+            observations[i].numpy()
+
+        for i in range(
+            num_agents
+        )
+    }
+
+    action_masks = {
+
+        f"blue_agent_{i}":
+            [1.0] * action_dim
+
+        for i in range(
+            num_agents
+        )
+    }
+
+    actions = model.select_actions(
+
+        observation_dict,
+
+        action_masks=action_masks,
+
+        deterministic=True
+    )
+
+    print(
+        "Selected actions:",
+        actions
+    )
+
+    print(
+        "\n===== MODEL TEST PASSED ====="
+    )
