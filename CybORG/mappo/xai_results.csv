@@ -1,0 +1,12 @@
+episode,step,agent_id,selected_action,action_probability,decision_margin,feature_index,feature_name,feature_value,perturbed_probability,effect,importance
+1,5,blue_agent_1,BlockTrafficZone,1.0,1.0,0,Feature 0,54787.0,0.13423730432987213,0.8657626956701279,0.8657626956701279
+2,4,blue_agent_4,Monitor,1.0,1.0,0,Feature 0,57213.0,0.1189468577504158,0.8810531422495842,0.8810531422495842
+2,6,blue_agent_4,Monitor,1.0,1.0,0,Feature 0,57692.0,0.1189468577504158,0.8810531422495842,0.8810531422495842
+2,7,blue_agent_4,Monitor,1.0,1.0,0,Feature 0,58791.0,0.1189468577504158,0.8810531422495842,0.8810531422495842
+2,9,blue_agent_0,Analyse,1.0,1.0,5,Feature 5,52177.0,0.0,1.0,1.0
+2,9,blue_agent_0,Analyse,1.0,1.0,3,Feature 3,53526.0,0.9999972581863403,2.7418136596679688e-06,2.7418136596679688e-06
+2,9,blue_agent_0,Analyse,1.0,1.0,0,Feature 0,22.0,1.0,0.0,0.0
+2,9,blue_agent_0,Analyse,1.0,1.0,1,Feature 1,51805.0,1.0,0.0,0.0
+2,9,blue_agent_0,Analyse,1.0,1.0,2,Feature 2,25.0,1.0,0.0,0.0
+2,9,blue_agent_0,Analyse,1.0,1.0,4,Feature 4,80.0,1.0,0.0,0.0
+2,9,blue_agent_4,Monitor,1.0,1.0,0,Feature 0,59616.0,0.1189468577504158,0.8810531422495842,0.8810531422495842
