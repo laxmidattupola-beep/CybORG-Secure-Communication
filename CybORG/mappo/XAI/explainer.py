@@ -1,3 +1,4 @@
+import re
 import numpy as np
 import torch
 
@@ -84,6 +85,7 @@ class MAPPOExplainer:
                 obs_tensor,
                 mask_tensor,
             )
+
             probabilities = distribution.probs.squeeze(0).detach().cpu().numpy()
 
         return probabilities
@@ -91,6 +93,31 @@ class MAPPOExplainer:
     # ------------------------------------------------------------
     # Main explanation
     # ------------------------------------------------------------
+
+    @staticmethod
+    def _is_identifier_or_unhelpful_feature(name, value):
+        """Exclude identifiers, raw ports, padding, and unnamed features."""
+        import re
+
+        path = str(name).strip().lower()
+        normalized = re.sub(r"[^a-z0-9]+", " ", path).strip()
+        tokens = set(normalized.split())
+
+        excluded_names = {
+            "pid", "ppid", "gid", "uid",
+            "session", "sessionid", "groupid",
+            "processid", "parentprocessid",
+            "localport", "remoteport", "port",
+            "padding", "feature"
+        }
+
+        if tokens.intersection(excluded_names):
+            return True
+
+        if re.fullmatch(r"feature\s*\d+", normalized):
+            return True
+
+        return False
 
     def explain(
         self,
@@ -101,241 +128,189 @@ class MAPPOExplainer:
         feature_names=None,
         agent_id=None,
     ):
-        observation = np.asarray(
-            observation,
-            dtype=np.float32,
-        ).reshape(-1)
-
+        observation = np.asarray(observation, dtype=np.float32).reshape(-1)
         action = int(action)
 
         if feature_names is None:
-            feature_names = [
-                f"Feature {i}"
-                for i in range(len(observation))
-            ]
+            feature_names = [f"Feature {i}" for i in range(len(observation))]
         else:
             feature_names = list(feature_names)
-
             if len(feature_names) < len(observation):
                 feature_names.extend(
-                    f"Feature {i}"
-                    for i in range(
-                        len(feature_names),
-                        len(observation),
-                    )
+                    f"Feature {i}" for i in range(len(feature_names), len(observation))
                 )
-
             feature_names = feature_names[:len(observation)]
 
         actor = self._actor(agent_index)
+        original_probabilities = self._get_probabilities(actor, observation, action_mask)
+        if action < 0 or action >= len(original_probabilities):
+            raise ValueError(f"Action index {action} is outside the policy output.")
 
-        # --------------------------------------------------------
-        # Original policy output
-        # --------------------------------------------------------
-
-        original_probabilities = self._get_probabilities(
-            actor,
-            observation,
-            action_mask,
+        selected_probability = float(original_probabilities[action])
+        other_probabilities = np.delete(original_probabilities, action)
+        decision_margin = (
+            selected_probability - float(np.max(other_probabilities))
+            if len(other_probabilities) else selected_probability
         )
 
-        selected_probability = float(
-            original_probabilities[action]
-        )
+        base_result = {
+            "agent_id": agent_id,
+            "agent_index": agent_index,
+            "selected_action": action,
+            "selected_action_name": self._action_name(action),
+            "selected_probability": selected_probability,
+            "decision_margin": float(decision_margin),
+            "action_probabilities": original_probabilities,
+            "features": [],
+            "has_observable_features": False,
+            "status": "NO_OBSERVABLE_FEATURES",
+        }
 
-        sorted_probs = np.sort(
-            original_probabilities
-        )[::-1]
-
-        if len(sorted_probs) >= 2:
-            decision_margin = float(
-                sorted_probs[0] - sorted_probs[1]
-            )
-        else:
-            decision_margin = float(sorted_probs[0])
-
-        # --------------------------------------------------------
-        # Identify usable features
-        # --------------------------------------------------------
+        # If only one action is permitted, the action was effectively forced by
+        # the environment mask. Do not attribute it to observation features.
+        if action_mask is not None:
+            try:
+                mask = np.asarray(action_mask, dtype=np.float32).reshape(-1)
+                if len(mask) == len(self.action_names) and np.count_nonzero(mask > 0) == 1:
+                    base_result.update({
+                        "status": "FORCED_ACTION_MASK",
+                        "interpretation": (
+                            f"'{self._action_name(action)}' was the only action permitted "
+                            "by the action mask. This is not a feature-based policy explanation."
+                        ),
+                    })
+                    return base_result
+            except (TypeError, ValueError):
+                pass
 
         finite_mask = np.isfinite(observation)
+        nonzero_indices = np.where(finite_mask & (np.abs(observation) > 1e-12))[0]
 
-        nonzero_indices = np.where(
-            finite_mask & (np.abs(observation) > 1e-12)
-        )[0]
-
-        # Limit expensive perturbations.
-        if len(nonzero_indices) > self.max_features:
-            # Use largest absolute-value features as candidates.
-            ranked = nonzero_indices[
-                np.argsort(
-                    np.abs(observation[nonzero_indices])
-                )[::-1]
-            ]
-
-            candidate_indices = ranked[:self.max_features]
-        else:
-            candidate_indices = nonzero_indices
-
-        # --------------------------------------------------------
-        # No observable features
-        # --------------------------------------------------------
-
-        if len(candidate_indices) == 0:
-            return {
-                "agent_id": agent_id,
-                "agent_index": agent_index,
-                "selected_action": action,
-                "selected_action_name": self._action_name(action),
-                "selected_probability": selected_probability,
-                "decision_margin": decision_margin,
-                "action_probabilities": original_probabilities,
-                "features": [],
-                "has_observable_features": False,
+        if len(nonzero_indices) == 0:
+            only_padding = all(str(name).lower().startswith("padding[") for name in feature_names)
+            base_result.update({
+                "status": "EMPTY_OBSERVATION" if only_padding else "ZERO_VALUED_OBSERVATION",
                 "interpretation": (
-                    "No non-zero environmental features were "
-                    "available for ablation. The current observation "
-                    "does not provide a feature-level explanation."
+                    "The observation contains no non-zero numeric values. No feature-level "
+                    "attribution can be calculated without inventing or carrying forward data."
                 ),
-            }
+            })
+            return base_result
 
-        # --------------------------------------------------------
-        # Batched perturbations
-        # --------------------------------------------------------
+        eligible_indices = [
+            int(i) for i in nonzero_indices
+            if not self._is_identifier_or_unhelpful_feature(feature_names[int(i)], observation[int(i)])
+        ]
 
-        perturbed = np.repeat(
-            observation.reshape(1, -1),
-            len(candidate_indices),
-            axis=0,
+        # Only use interpretable features. Never reintroduce excluded
+        # identifiers or raw ports as a fallback explanation.
+        # A missing checkpoint encoder version means names are intentionally
+        # generic. Report numeric sensitivity only, never semantic attribution.
+        generic_dimension_names = all(
+            re.fullmatch(r"input dimension\s+\d+", str(name).strip().lower())
+            for name in feature_names
         )
+        nonsemantic_fallback = generic_dimension_names
 
+        if not eligible_indices:
+            base_result.update({
+                "status": "NO_SEMANTIC_FEATURES",
+                "interpretation": (
+                    "No eligible semantic features were found in this observation. "
+                    "Identifiers, raw port numbers, padding, and unnamed features "
+                    "are excluded, so no semantic feature attribution is available."
+                ),
+            })
+            return base_result
+
+        # Select candidates by observation order, not absolute magnitude. Ranking
+        # by magnitude would systematically prioritize raw numeric scales.
+        candidate_indices = np.asarray(eligible_indices[:self.max_features], dtype=int)
+
+        perturbed = np.repeat(observation.reshape(1, -1), len(candidate_indices), axis=0)
         for row, feature_index in enumerate(candidate_indices):
-            perturbed[
-                row,
-                feature_index
-            ] = self.baseline
+            perturbed[row, feature_index] = self.baseline
 
-        obs_tensor = torch.tensor(
-            perturbed,
-            dtype=torch.float32,
-            device=self.device,
-        )
-
+        obs_tensor = torch.tensor(perturbed, dtype=torch.float32, device=self.device)
         mask_tensor = None
-
         if action_mask is not None:
-            mask = np.asarray(
-                action_mask,
-                dtype=np.float32,
-            ).reshape(-1)
-
+            mask = np.asarray(action_mask, dtype=np.float32).reshape(-1)
             if len(mask) == len(self.action_names):
                 mask_tensor = torch.tensor(
-                    np.repeat(
-                        mask.reshape(1, -1),
-                        len(candidate_indices),
-                        axis=0,
-                    ),
+                    np.repeat(mask.reshape(1, -1), len(candidate_indices), axis=0),
                     dtype=torch.float32,
                     device=self.device,
                 )
 
         with torch.no_grad():
-            distribution = actor.get_distribution(
-                obs_tensor,
-                mask_tensor,
-            )
-
+            distribution = actor.get_distribution(obs_tensor, mask_tensor)
             perturbed_probabilities = (
-                distribution.probs[:, action]
-                .detach()
-                .cpu()
-                .numpy()
+                distribution.probs[:, action].detach().cpu().numpy()
             )
 
-        # --------------------------------------------------------
-        # Calculate effects
-        # --------------------------------------------------------
-
-        effects = (
-            selected_probability
-            - perturbed_probabilities
-        )
-
-        importances = np.abs(effects)
-
+        effects = selected_probability - perturbed_probabilities
         features = []
+        for position, feature_index in enumerate(candidate_indices):
+            effect = float(effects[position])
+            features.append({
+                "index": int(feature_index),
+                "name": feature_names[int(feature_index)],
+                "value": float(observation[int(feature_index)]),
+                "importance": abs(effect),
+                "effect": effect,
+                "probability_effect": effect,
+                "direction": "SUPPORTS" if effect > 0 else "SUPPRESSES" if effect < 0 else "NEUTRAL",
+                "perturbed_probability": float(perturbed_probabilities[position]),
+            })
 
-        for feature_index, effect, importance in zip(
-            candidate_indices,
-            effects,
-            importances,
-        ):
-            effect = float(effect)
-            importance = float(importance)
-
-            if effect > 0:
-                direction = "SUPPORTS"
-            elif effect < 0:
-                direction = "SUPPRESSES"
-            else:
-                direction = "NEUTRAL"
-
-            features.append(
-                {
-                    "index": int(feature_index),
-                    "name": feature_names[feature_index],
-                    "value": float(observation[feature_index]),
-                    "importance": importance,
-                    "effect": effect,
-                    "direction": direction,
-                    "perturbed_probability": float(
-                        perturbed_probabilities[
-                            list(candidate_indices).index(feature_index)
-                        ]
-                    ),
-                }
-            )
-
-        features.sort(
-            key=lambda item: item["importance"],
-            reverse=True,
-        )
-
+        features.sort(key=lambda item: item["importance"], reverse=True)
         top_features = features[:self.top_k]
-
         selected_name = self._action_name(action)
+        strongest = top_features[0] if top_features else None
 
-        if top_features:
-            strongest = top_features[0]
-
-            interpretation = (
-                f"The agent selected '{selected_name}'. "
-                f"The strongest observed feature was "
-                f"'{strongest['name']}' "
-                f"(value={strongest['value']:.4f}), "
-                f"which {strongest['direction'].lower()} the decision "
-                f"with an ablation effect of "
-                f"{strongest['effect']:+.4f}."
-            )
+        if strongest and strongest["importance"] > 1e-8:
+            if nonsemantic_fallback:
+                interpretation = (
+                    f"The policy selected '{selected_name}'. Ablating the numeric input "
+                    f"'{strongest['name']}' changed its probability from "
+                    f"{selected_probability:.4f} to {strongest['perturbed_probability']:.4f} "
+                    f"(effect {strongest['effect']:+.4f}). The tested inputs were identifiers "
+                    "or other non-semantic numeric fields, so this is only a model-sensitivity "
+                    "diagnostic—not a semantic explanation and not proof of an attack."
+                )
+                status = "NON_SEMANTIC_INPUT_SENSITIVITY"
+            else:
+                interpretation = (
+                    f"The policy selected '{selected_name}'. Ablating the observable feature "
+                    f"'{strongest['name']}' changed its probability from "
+                    f"{selected_probability:.4f} to {strongest['perturbed_probability']:.4f} "
+                    f"(effect {strongest['effect']:+.4f}). This is a model-sensitivity result, "
+                    "not proof that the feature represents an attack."
+                )
+                status = "FEATURE_ATTRIBUTIONS"
         else:
-            interpretation = (
-                f"The agent selected '{selected_name}', but no "
-                f"meaningful feature-level effect was detected."
-            )
+            if nonsemantic_fallback:
+                interpretation = (
+                    f"The policy selected '{selected_name}', but ablating the available "
+                    "non-semantic numeric inputs did not measurably change its probability. "
+                    "This observation does not support a semantic feature-level explanation."
+                )
+                status = "NO_NON_SEMANTIC_INPUT_EFFECT"
+            else:
+                interpretation = (
+                    f"The policy selected '{selected_name}', but the tested semantic features "
+                    "did not produce a measurable change in its probability."
+                )
+                status = "NO_FEATURE_EFFECT"
 
-        return {
-            "agent_id": agent_id,
-            "agent_index": agent_index,
-            "selected_action": action,
-            "selected_action_name": selected_name,
-            "selected_probability": selected_probability,
-            "decision_margin": decision_margin,
-            "action_probabilities": original_probabilities,
+        base_result.update({
             "features": top_features,
             "has_observable_features": True,
+            "status": status,
+            "attribution_type": "non_semantic_numeric_sensitivity" if nonsemantic_fallback else "semantic_feature_sensitivity",
             "interpretation": interpretation,
-        }
+        })
+        return base_result
 
     # ------------------------------------------------------------
     # Printing
@@ -387,13 +362,8 @@ class MAPPOExplainer:
         features = explanation.get("features", [])
 
         if not explanation.get("has_observable_features", False):
-            print("No observable environmental features were available.")
-            print()
-            print("XAI Status:")
-            print(
-                "The current 256-D observation contains no non-zero "
-                "features that can be ablated."
-            )
+            print("No feature-level attribution was generated.")
+            print(f"XAI Status: {explanation.get('status', 'NO_OBSERVABLE_FEATURES')}")
         elif not features:
             print(
                 "Observable features were present, but no measurable "

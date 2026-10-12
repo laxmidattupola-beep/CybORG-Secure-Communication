@@ -1,6 +1,8 @@
 import inspect
+import enum
 
 import numpy as np
+import CybORG.Shared.Enums as CyEnums
 
 
 
@@ -24,6 +26,84 @@ from CybORG.Simulator.Scenarios.EnterpriseScenarioGenerator import (
 
 
 
+
+
+# Stable semantic input schema for the XAI-ready MAPPO copy.
+# This replaces the old numeric-only flattening, which mostly retained
+# PID/PPID/port values and dropped categorical CybORG enum observations.
+def _build_semantic_feature_names():
+    enum_names = []
+    enum_classes = []
+    for candidate in vars(CyEnums).values():
+        if isinstance(candidate, type):
+            try:
+                if issubclass(candidate, enum.Enum) and candidate.__module__ == CyEnums.__name__:
+                    enum_classes.append(candidate)
+            except TypeError:
+                pass
+
+    for enum_class in sorted(enum_classes, key=lambda item: item.__name__):
+        for member in enum_class:
+            enum_names.append(f"enum.{enum_class.__name__}.{member.name}")
+
+    structure_metrics = [
+        "structure.host_count",
+        "structure.process_count",
+        "structure.connection_count",
+        "structure.interface_count",
+        "structure.session_count",
+        "structure.file_count",
+        "structure.user_count",
+        "structure.vulnerability_count",
+        "structure.system_info_count",
+        "structure.network_connection_count",
+        "structure.blocked_ip_count",
+        "structure.processes_with_process_name_count",
+        "structure.processes_with_known_process_count",
+        "structure.processes_with_program_name_count",
+        "structure.processes_with_service_name_count",
+        "structure.processes_with_username_count",
+        "structure.processes_with_known_path_count",
+        "structure.processes_with_process_type_count",
+        "structure.processes_with_process_version_count",
+        "structure.processes_with_status_count",
+        "structure.processes_with_transport_protocol_count",
+        "structure.processes_with_application_protocol_count",
+        "structure.processes_with_vulnerability_count",
+        "structure.hosts_with_system_info_count",
+        "structure.hosts_with_interface_count",
+        "structure.hosts_with_processes_count",
+        "structure.hosts_with_sessions_count",
+        "structure.hosts_with_files_count",
+        "structure.hosts_with_users_count",
+        "structure.hosts_with_vulnerabilities_count",
+    ]
+
+    structural_keys = [
+        "success", "processes", "connections", "interface", "sessions",
+        "files", "users", "vulnerability", "systeminfo", "knownprocess",
+        "programname", "processname", "servicename", "username",
+        "knownpath", "processtype", "processversion", "status",
+        "transportprotocol", "applicationprotocol", "ostype",
+        "osdistribution", "osversion", "oskernelversion", "architecture",
+        "ospatches", "subnet", "interfacename", "networkconnections",
+        "blockedips", "filetype", "vendor", "version", "signed",
+        "userpermissions", "grouppermissions", "defaultpermissions",
+        "sessiontype", "sessionstatus", "sourcehost", "desthost",
+    ]
+    structural_names = [
+        f"structure.field_count.{key}" for key in structural_keys
+    ]
+
+    names = enum_names + structure_metrics + structural_names
+    names = names[:256]
+    while len(names) < 256:
+        names.append(f"padding[{len(names)}]")
+    return names
+
+
+SEMANTIC_FEATURE_NAMES = _build_semantic_feature_names()
+OBSERVATION_ENCODER_VERSION = "semantic_enum_aggregate_v1"
 
 
 class CybORGMAPPOEnv:
@@ -153,6 +233,8 @@ class CybORGMAPPOEnv:
         # Human-readable feature mapping for XAI.
         # This does not change the MAPPO observation vector.
         self.feature_names_by_agent = {}
+        # Keep descriptive XAI context separate from MAPPO inputs.
+        self.xai_context_by_agent = {}
 
 
 
@@ -280,56 +362,256 @@ class CybORGMAPPOEnv:
 
     def _flatten_observation_with_names(self, observation):
         """
-        Recursively flatten a CybORG observation while preserving
-        the path of every numeric value.
+        Encode raw CybORG observations into a stable 256-value semantic vector.
 
-        The numeric traversal order is intentionally the same as the
-        original _flatten_observation() implementation so the trained
-        256-D MAPPO model remains compatible.
+        Categorical enum states are represented as presence indicators.
+        Structural counts summarize observed hosts/processes/connections.
+        Raw PIDs, PPIDs, ports, addresses, and arbitrary numeric identifiers
+        are deliberately not copied into the model input.
+
+        IMPORTANT: this encoder is different from the old numeric-only encoder.
+        A checkpoint trained with the old encoder must not be reused; train a
+        new checkpoint in this XAI copy before evaluating it.
         """
+        names = list(SEMANTIC_FEATURE_NAMES[:self.observation_dim])
+        vector = np.zeros(self.observation_dim, dtype=np.float32)
+        index_by_name = {name: index for index, name in enumerate(names)}
 
-        values = []
-        names = []
+        field_counts = {}
+        item_counts = {
+            "processes": 0,
+            "connections": 0,
+            "interface": 0,
+            "sessions": 0,
+            "files": 0,
+            "users": 0,
+            "vulnerability": 0,
+            "systeminfo": 0,
+            "networkconnections": 0,
+            "blockedips": 0,
+        }
+        process_records = []
+        host_records = []
 
-        def flatten(value, path="observation"):
+        def normalize_key(key):
+            return "".join(character.lower() for character in str(key)
+                           if character.isalnum())
+
+        def walk(value):
+            if isinstance(value, enum.Enum):
+                feature_name = f"enum.{type(value).__name__}.{value.name}"
+                feature_index = index_by_name.get(feature_name)
+                if feature_index is not None:
+                    vector[feature_index] = 1.0
+                return
+
             if isinstance(value, dict):
-                for key, item in value.items():
-                    flatten(item, f"{path}.{key}")
+                for key, child in value.items():
+                    # CybORG observation fields may use Enum dictionary keys.
+                    if isinstance(key, enum.Enum):
+                        walk(key)
+                    normalized_key = normalize_key(
+                        key.name if isinstance(key, enum.Enum) else key
+                    )
+                    field_counts[normalized_key] = (
+                        field_counts.get(normalized_key, 0) + 1
+                    )
 
-            elif isinstance(value, (list, tuple)):
-                for index, item in enumerate(value):
-                    flatten(item, f"{path}[{index}]")
+                    if normalized_key in item_counts:
+                        if isinstance(child, (list, tuple)):
+                            item_counts[normalized_key] += len(child)
+                        elif child is not None:
+                            item_counts[normalized_key] += 1
 
-            elif isinstance(value, bool):
-                values.append(float(value))
-                names.append(path)
+                    if normalized_key == "processes" and isinstance(child, (list, tuple)):
+                        process_records.extend(
+                            item for item in child if isinstance(item, dict)
+                        )
 
-            elif isinstance(
-                value,
-                (
-                    int,
-                    float,
-                    np.integer,
-                    np.floating
-                )
-            ):
-                values.append(float(value))
-                names.append(path)
+                    if isinstance(child, dict):
+                        walk(child)
+                    elif isinstance(child, (list, tuple)):
+                        for item in child:
+                            walk(item)
+                    elif isinstance(child, enum.Enum):
+                        walk(child)
+                return
 
-            else:
-                try:
-                    converted = float(value)
-                    values.append(converted)
-                    names.append(path)
-                except (TypeError, ValueError):
-                    pass
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    walk(item)
 
-        flatten(observation)
+        if isinstance(observation, dict):
+            metadata_keys = {"success", "message", "msg"}
+            for key, value in observation.items():
+                if (isinstance(value, dict)
+                        and normalize_key(key) not in metadata_keys):
+                    host_records.append(value)
 
-        return (
-            np.asarray(values, dtype=np.float32),
-            names
+        walk(observation)
+
+        metric_values = {
+            "structure.host_count": len(host_records),
+            "structure.process_count": item_counts["processes"],
+            "structure.connection_count": item_counts["connections"],
+            "structure.interface_count": item_counts["interface"],
+            "structure.session_count": item_counts["sessions"],
+            "structure.file_count": item_counts["files"],
+            "structure.user_count": item_counts["users"],
+            "structure.vulnerability_count": item_counts["vulnerability"],
+            "structure.system_info_count": item_counts["systeminfo"],
+            "structure.network_connection_count": item_counts["networkconnections"],
+            "structure.blocked_ip_count": item_counts["blockedips"],
+            "structure.processes_with_process_name_count": sum(
+                "processname" in record for record in process_records
+            ),
+            "structure.processes_with_known_process_count": sum(
+                "knownprocess" in [normalize_key(k) for k in record]
+                for record in process_records
+            ),
+            "structure.processes_with_program_name_count": sum(
+                "programname" in [normalize_key(k) for k in record]
+                for record in process_records
+            ),
+            "structure.processes_with_service_name_count": sum(
+                "servicename" in [normalize_key(k) for k in record]
+                for record in process_records
+            ),
+            "structure.processes_with_username_count": sum(
+                "username" in [normalize_key(k) for k in record]
+                for record in process_records
+            ),
+            "structure.processes_with_known_path_count": sum(
+                "knownpath" in [normalize_key(k) for k in record]
+                for record in process_records
+            ),
+            "structure.processes_with_process_type_count": sum(
+                "processtype" in [normalize_key(k) for k in record]
+                for record in process_records
+            ),
+            "structure.processes_with_process_version_count": sum(
+                "processversion" in [normalize_key(k) for k in record]
+                for record in process_records
+            ),
+            "structure.processes_with_status_count": sum(
+                "status" in [normalize_key(k) for k in record]
+                for record in process_records
+            ),
+            "structure.processes_with_transport_protocol_count": sum(
+                "transportprotocol" in [normalize_key(k) for k in record]
+                for record in process_records
+            ),
+            "structure.processes_with_application_protocol_count": sum(
+                "applicationprotocol" in [normalize_key(k) for k in record]
+                for record in process_records
+            ),
+            "structure.processes_with_vulnerability_count": sum(
+                "vulnerability" in [normalize_key(k) for k in record]
+                for record in process_records
+            ),
+            "structure.hosts_with_system_info_count": sum(
+                "systeminfo" in [normalize_key(k) for k in host]
+                for host in host_records
+            ),
+            "structure.hosts_with_interface_count": sum(
+                "interface" in [normalize_key(k) for k in host]
+                for host in host_records
+            ),
+            "structure.hosts_with_processes_count": sum(
+                "processes" in [normalize_key(k) for k in host]
+                for host in host_records
+            ),
+            "structure.hosts_with_sessions_count": sum(
+                "sessions" in [normalize_key(k) for k in host]
+                for host in host_records
+            ),
+            "structure.hosts_with_files_count": sum(
+                "files" in [normalize_key(k) for k in host]
+                for host in host_records
+            ),
+            "structure.hosts_with_users_count": sum(
+                "users" in [normalize_key(k) for k in host]
+                for host in host_records
+            ),
+            "structure.hosts_with_vulnerabilities_count": sum(
+                "vulnerability" in [normalize_key(k) for k in host]
+                for host in host_records
+            ),
+        }
+
+        for feature_name, count in metric_values.items():
+            feature_index = index_by_name.get(feature_name)
+            if feature_index is not None:
+                vector[feature_index] = min(float(count), 10.0) / 10.0
+
+        for feature_name in names:
+            prefix = "structure.field_count."
+            if feature_name.startswith(prefix):
+                key_name = feature_name[len(prefix):]
+                feature_index = index_by_name[feature_name]
+                vector[feature_index] = min(
+                    float(field_counts.get(key_name, 0)), 10.0
+                ) / 10.0
+
+        return vector, names
+
+    def extract_xai_context(self, observation):
+        """Extract descriptive context without changing model inputs."""
+        context = {}
+        keywords = (
+            "success", "hostname", "ostype", "osdistribution",
+            "osversion", "architecture", "interface",
+            "ip_address", "subnet", "username", "type",
         )
+        visited = set()
+
+        def walk(value, path="observation", depth=0):
+            if depth > 12 or value is None:
+                return
+
+            if isinstance(value, (str, int, float, bool)):
+                if any(word in path.lower() for word in keywords):
+                    context[path] = str(value)
+                return
+
+            if hasattr(value, "name") and hasattr(value, "value"):
+                if any(word in path.lower() for word in keywords):
+                    context[path] = str(value.name)
+                return
+
+            if isinstance(value, (list, tuple)):
+                for i, item in enumerate(value):
+                    walk(item, f"{path}[{i}]", depth + 1)
+                return
+
+            if isinstance(value, dict):
+                obj_id = id(value)
+                if obj_id in visited:
+                    return
+                visited.add(obj_id)
+                for key, item in value.items():
+                    walk(item, f"{path}.{key}", depth + 1)
+                return
+
+            # Handle CybORG custom objects.
+            attributes = getattr(value, "__dict__", None)
+            if isinstance(attributes, dict):
+                obj_id = id(value)
+                if obj_id in visited:
+                    return
+                visited.add(obj_id)
+                for key, item in attributes.items():
+                    if not key.startswith("_"):
+                        walk(item, f"{path}.{key}", depth + 1)
+
+        walk(observation)
+        return context
+    
+    
+    def get_xai_context(self, agent_id):
+        """Return context captured from the original CybORG observation."""
+        return dict(self.xai_context_by_agent.get(agent_id, {}))
+
 
     def _flatten_observation(self, observation):
         """
@@ -351,10 +633,21 @@ class CybORGMAPPOEnv:
         IMPORTANT:
         The numeric observation itself is unchanged.
         """
-
+        # Extract semantic context from the ORIGINAL observation,
+        # before it becomes a numeric NumPy array.
+        if agent_id is not None:
+            self.xai_context_by_agent[agent_id] = (
+                self.extract_xai_context(observation)
+            )
         vector, names = self._flatten_observation_with_names(
             observation
         )
+        if agent_id == "blue_agent_0":
+            active = int(np.count_nonzero(vector))
+            print(
+                f"[SEMANTIC FEATURE AUDIT] active features: {active}; "
+                f"model input size: {self.observation_dim}"
+            )
 
         if len(vector) < self.observation_dim:
 
@@ -462,11 +755,7 @@ class CybORGMAPPOEnv:
 
                 # The actual observations are stored here.
 
-                raw_observation = (
-
-                    results.observation[agent_id]
-
-                )
+                raw_observation = self.env.get_observation(agent_id)
 
 
 
@@ -484,30 +773,69 @@ class CybORGMAPPOEnv:
 
 
 
-            except Exception:
+            # except Exception:
 
 
 
-                # If an observation is unavailable,
+            #     # If an observation is unavailable,
 
-                # use a zero vector.
+            #     # use a zero vector.
 
+
+
+            #     observations[agent_id] = np.zeros(
+
+            #         self.observation_dim,
+
+            #         dtype=np.float32
+
+            #     )
+
+            #     self.feature_names_by_agent[agent_id] = [
+            #         f"missing_observation[{k}]"
+            #         for k in range(self.observation_dim)
+            #     ]
+
+            # except Exception as error:
+            #     print(
+            #         f"[OBSERVATION ERROR] {agent_id}: "
+            #         f"{type(error).__name__}: {error}"
+            #     )
+
+            #     observations[agent_id] = np.zeros(
+            #         self.observation_dim,
+            #         dtype=np.float32
+            #     )
+
+            #     self.feature_names_by_agent[agent_id] = [
+            #         f"missing_observation[{k}]"
+            #         for k in range(self.observation_dim)
+            #     ]
+            except Exception as error:
+                print(
+                    f"[OBSERVATION ERROR] {agent_id}: "
+                    f"{type(error).__name__}: {error}"
+                )
+                
+                print(
+                    "[OBSERVATION DEBUG] "
+                    f"agent_id={agent_id!r}, "
+                    f"results_type={type(results).__name__}, "
+                    f"observation_type={type(results.observation).__name__}, "
+                    f"observation_keys="
+                    f"{list(results.observation.keys())[:30] if isinstance(results.observation, dict) else 'not a dictionary'}"
+                )
 
 
                 observations[agent_id] = np.zeros(
-
                     self.observation_dim,
-
                     dtype=np.float32
-
                 )
-
+                self.xai_context_by_agent[agent_id] = {}
                 self.feature_names_by_agent[agent_id] = [
                     f"missing_observation[{k}]"
                     for k in range(self.observation_dim)
                 ]
-
-
 
         return observations
 
@@ -552,6 +880,31 @@ class CybORGMAPPOEnv:
     # =============================================================
 
 
+
+    def is_action_in_progress(self, agent_id):
+        """Return True when CybORG is still executing this agent's prior action.
+
+        During multi-tick actions, CybORG emits an IN_PROGRESS observation and
+        does not accept a replacement action from the wrapper. The current
+        MAPPO output at that timestep is therefore not a newly executed choice.
+        """
+        try:
+            controller = self.env.environment_controller
+            progress = controller.actions_in_progress.get(agent_id)
+            return progress is not None
+        except (AttributeError, TypeError):
+            return False
+
+    def get_in_progress_action_name(self, agent_id):
+        """Get the class name of an action that is still being executed."""
+        try:
+            progress = self.env.environment_controller.actions_in_progress.get(agent_id)
+            if progress is None:
+                return ""
+            action = progress.get("action") if isinstance(progress, dict) else None
+            return type(action).__name__ if action is not None else "ACTION_IN_PROGRESS"
+        except (AttributeError, TypeError):
+            return ""
 
     def get_action_mask(self, agent_id):
 
@@ -1209,40 +1562,61 @@ class CybORGMAPPOEnv:
 
 
 
+        # if action_class is None:
+
+
+
+        #     sleep_class = self._find_action_class(
+
+        #         agent_id,
+
+        #         "Sleep"
+
+        #     )
+
+
+
+        #     if sleep_class is not None:
+
+
+
+        #         try:
+
+
+
+        #             return sleep_class()
+
+
+
+        #         except Exception:
+
+
+
+        #             pass
+
+        #changed here fallback if action is none:
+
+        
         if action_class is None:
-
-
-
-            sleep_class = self._find_action_class(
-
-                agent_id,
-
-                "Sleep"
-
+            print(
+                f"[ACTION FALLBACK] {agent_id}: "
+                f"{action_name} unavailable; using Sleep"
             )
 
-
+            sleep_class = self._find_action_class(
+                agent_id,
+                "Sleep"
+            )
 
             if sleep_class is not None:
-
-
-
                 try:
-
-
-
                     return sleep_class()
-
-
-
                 except Exception:
-
-
-
                     pass
-
-
-
+        
+        
+        
+        
             return None
 
 
@@ -1291,7 +1665,10 @@ class CybORGMAPPOEnv:
 
         except Exception:
 
-
+            print(
+                f"[ACTION FALLBACK] {agent_id}: "
+                f"Could not construct {action_name}; using Sleep"
+            )
 
             # If parameter construction fails,
 
@@ -1529,12 +1906,22 @@ class CybORGMAPPOEnv:
 
 
 
+        # result = self.env.parallel_step(
+
+        #     actions=cyborg_actions
+
+        # )
+
+        
         result = self.env.parallel_step(
-
             actions=cyborg_actions
-
         )
 
+        # print(
+        #     "[REWARD DEBUG]",
+        #     type(raw_rewards).__name__,
+        #     repr(raw_rewards)
+        # )
 
 
         # ---------------------------------------------------------
@@ -1619,8 +2006,6 @@ class CybORGMAPPOEnv:
 
             infos = {}
 
-
-
         # ---------------------------------------------------------
 
         # Process observations
@@ -1671,6 +2056,7 @@ class CybORGMAPPOEnv:
 
                 )
 
+                self.xai_context_by_agent[agent_id] = {}
                 self.feature_names_by_agent[agent_id] = [
                     f"missing_observation[{k}]"
                     for k in range(self.observation_dim)
@@ -1943,3 +2329,4 @@ if __name__ == "__main__":
         "\n===== ENV TEST PASSED ====="
 
     )
+
