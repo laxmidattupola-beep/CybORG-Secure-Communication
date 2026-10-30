@@ -8,6 +8,10 @@ import torch
 from CybORG.mappo.cyborg_env import CybORGMAPPOEnv
 from CybORG.mappo.mappo import MAPPO
 from CybORG.mappo.XAI.explainer import MAPPOExplainer
+from CybORG.mappo.prediction_v2.prediction_monitor import (
+    MAPPOPredictionMonitor,
+    save_prediction_results,
+)
 
 
 # ============================================================
@@ -18,13 +22,14 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mappo_mod
 
 # Keep these small while testing XAI.
 # Increase later after everything is working.
-NUM_EPISODES = 2
-STEPS_PER_EPISODE = 10
+NUM_EPISODES = 30
+STEPS_PER_EPISODE = 100
 
 XAI_TOP_K = 10
 XAI_MAX_FEATURES = 128
 XAI_BASELINE = 0.0
 XAI_FREQUENCY = 1
+PREDICTION_EPISODE_STEPS = 100  # Match prediction model training metadata
 
 
 # ============================================================
@@ -494,6 +499,8 @@ def evaluate_mappo():
     episode_rewards = []
     explanation_count = 0
     xai_rows = []
+    prediction_rows = []
+    prediction_monitor = MAPPOPredictionMonitor()
 
     # --------------------------------------------------------
     # Episodes
@@ -512,6 +519,7 @@ def evaluate_mappo():
             reset_result,
             env
         )
+        prediction_monitor.reset_episode()
 
         total_reward = 0.0
         steps_taken = 0
@@ -535,6 +543,27 @@ def evaluate_mappo():
                     action_masks,
                     deterministic=True
                 )
+
+            # ------------------------------------------------
+            # Monitoring-only attack-risk predictions
+            # ------------------------------------------------
+
+            step_predictions = prediction_monitor.predict_all(
+                observations=observations,
+                step=step,
+                episode_steps=PREDICTION_EPISODE_STEPS,
+            )
+
+            for prediction in step_predictions:
+                row = dict(prediction)
+                row["episode"] = episode + 1
+                row["step"] = step + 1
+                prediction_rows.append(row)
+
+            print(
+                f"Prediction monitor: {len(step_predictions)} "
+                "zone/horizon predictions generated."
+            )
 
             print()
             print("MAPPO Actions:")
@@ -858,6 +887,27 @@ def evaluate_mappo():
         print(f"ERROR saving XAI CSV: {error}")
 
     # ========================================================
+    # SAVE PREDICTION RESULTS (SEPARATE FROM XAI)
+    # ========================================================
+
+    prediction_csv_path = os.path.join(
+        os.path.dirname(__file__),
+        "prediction_results.csv"
+    )
+
+    try:
+        save_prediction_results(
+            prediction_rows,
+            prediction_csv_path
+        )
+        print()
+        print(f"Prediction CSV saved to: {prediction_csv_path}")
+        print(f"Prediction data rows   : {len(prediction_rows)}")
+    except OSError as error:
+        print()
+        print(f"ERROR saving prediction CSV: {error}")
+
+    # ========================================================
     # FINAL RESULTS
     # ========================================================
 
@@ -886,4 +936,5 @@ def evaluate_mappo():
 
 if __name__ == "__main__":
     evaluate_mappo()
+
 

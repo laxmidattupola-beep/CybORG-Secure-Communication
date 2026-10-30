@@ -1,0 +1,106 @@
+"""Collect zone-level future attack-risk examples from CybORG.
+
+This simulator entry point is intentionally not run as part of the safe package
+build; run it locally only after reviewing the README and approving simulator execution.
+"""
+from __future__ import annotations
+import argparse, csv, json, random
+from collections import defaultdict, deque
+from pathlib import Path
+import numpy as np
+from CybORG.mappo.cyborg_env import CybORGMAPPOEnv
+from .config import PredictionConfig, DATA_DIR, ZONE_TO_AGENT
+from .features import zone_features, feature_names
+from .labels import (future_window_labels, merge_event_sequences, merge_attack_episodes, set_subnet_inventory)
+from .simulator_adapter import install_action_capture, true_state_red_sessions, events_from_captures, new_session_events
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Collect zone-level future attack-risk data")
+    parser.add_argument("--episodes", type=int, default=40)
+    parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output", type=Path, default=DATA_DIR / "zone_risk_dataset.csv")
+    args = parser.parse_args()
+    if args.episodes < 2 or args.steps < 11:
+        parser.error("Use at least 2 episodes and 11 steps; 100 steps is recommended")
+    config = PredictionConfig(episode_steps=args.steps, random_seed=args.seed).validate()
+    random.seed(args.seed); np.random.seed(args.seed)
+    all_rows, event_rows, attack_episode_rows = [], [], []
+    env = CybORGMAPPOEnv(steps=args.steps)
+    env.env.debug_observations = False
+    try:
+        for episode_id in range(args.episodes):
+            observations = env.reset()
+            # Refresh CIDR-to-zone resolution for this episode's live topology.
+            set_subnet_inventory(env.env.environment_controller.state.subnets)
+            captures = install_action_capture(env.env)
+            history = {zone: deque(maxlen=config.history_steps) for zone in ZONE_TO_AGENT}
+            previous_red_hosts = true_state_red_sessions(env.env)
+            episode_events = []
+            episode_features = []
+            foothold_by_step = {}
+            rng = np.random.default_rng(args.seed + episode_id)
+            for step in range(args.steps):
+                for capture in captures.values(): capture["action"] = None
+                current_red_hosts_at_decision = true_state_red_sessions(env.env)
+                from .labels import zone_for_host
+                foothold_zones = {zone_for_host(host) for host in current_red_hosts_at_decision}
+                foothold_by_step[step] = {zone: int(zone in foothold_zones) for zone in ZONE_TO_AGENT}
+                for zone, agent_id in ZONE_TO_AGENT.items():
+                    vector = zone_features(observations[agent_id], zone, step, args.steps, list(history[zone]))
+                    episode_features.append((step, zone, vector.copy()))
+                    history[zone].append(np.asarray(observations[agent_id], dtype=np.float32).copy())
+                actions = {agent_id: int(rng.integers(0, env.action_dim)) for agent_id in env.agent_ids}
+                next_observations, _rewards, terminated, _infos = env.step(actions)
+                episode_events.extend(events_from_captures(step + 1, captures))
+                current_red_hosts = true_state_red_sessions(env.env)
+                episode_events.extend(new_session_events(step + 1, previous_red_hosts, current_red_hosts))
+                previous_red_hosts = current_red_hosts
+                observations = next_observations
+                if terminated: break
+            labels = future_window_labels(episode_events, args.steps, config.windows, zones=ZONE_TO_AGENT.keys())
+            label_lookup = {(r["step"], r["zone"]): r for r in labels}
+            merged = merge_event_sequences(episode_events, config.event_merge_gap)
+            attack_merged = merge_attack_episodes(episode_events, config.event_merge_gap)
+            for item in attack_merged:
+                attack_episode_rows.append({"episode_id": episode_id, **{k: (";".join(v) if isinstance(v, list) else v) for k,v in item.items()}})
+            for item in merged:
+                event_rows.append({"episode_id": episode_id, **{k: (";".join(v) if isinstance(v, list) else v) for k,v in item.items()}})
+            for step, zone, vector in episode_features:
+                label_row = label_lookup[(step, zone)]
+                row = {"episode_id": episode_id, "step": step, "zone": zone}
+                row.update({name: float(value) for name, value in zip(feature_names(), vector)})
+                row.update({k: v for k,v in label_row.items() if k not in {"step", "zone"}})
+                # Simulator-derived foothold is an evaluation stratum only, never a feature.
+                row["evaluation_stratum_compromised"] = foothold_by_step.get(step, {}).get(zone, 0)
+                all_rows.append(row)
+            print(f"Episode {episode_id + 1}/{args.episodes}: {len(episode_events)} raw events, {len(merged)} merged events")
+    finally:
+        env.close()
+    if not all_rows:
+        raise RuntimeError("No rows collected; refusing to write an empty dataset")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    columns = list(all_rows[0].keys())
+    with args.output.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns); writer.writeheader(); writer.writerows(all_rows)
+    event_path = args.output.with_name(args.output.stem + "_events.csv")
+    if event_rows:
+        with event_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(event_rows[0].keys())); writer.writeheader(); writer.writerows(event_rows)
+    # Primary event episodes merge attempts, compromises and damage together per zone.
+    # This second file is for event-count/lead-time reporting; it is not the step label.
+    # Reconstruct from the per-episode event records retained in the collection loop below.
+    attack_path = args.output.with_name(args.output.stem + "_attack_episodes.csv")
+    if attack_episode_rows:
+        with attack_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(attack_episode_rows[0].keys())); writer.writeheader(); writer.writerows(attack_episode_rows)
+    metadata = {"rows": len(all_rows), "episodes_requested": args.episodes, "steps_requested": args.steps,
+                "zones": list(ZONE_TO_AGENT), "windows": list(config.windows), "event_merge_gap": config.event_merge_gap,
+                "feature_count": len(feature_names()), "label_definition": "future attack attempt or new red session; compromise-only secondary",
+                "evaluation_stratum_compromised_is_not_a_feature": True,
+                "warning": "Validate action target extraction and true-state session schema before trusting collected labels."}
+    args.output.with_suffix(".metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print(f"Saved {len(all_rows)} zone-step rows to {args.output.resolve()}")
+
+if __name__ == "__main__": main()

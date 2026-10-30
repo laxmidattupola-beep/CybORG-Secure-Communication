@@ -1,0 +1,28 @@
+import unittest
+from CybORG.mappo.prediction_v2.labels import RedEvent, zone_for_host, merge_event_sequences, future_window_labels
+
+class LabelTests(unittest.TestCase):
+    def test_zone_mapping(self):
+        self.assertEqual(zone_for_host('restricted_zone_a_subnet_server_host_0'), 'restricted_a')
+        self.assertEqual(zone_for_host('office_network_subnet_user_host_1'), 'hq')
+        self.assertIsNone(zone_for_host('contractor_network_subnet_user_host_1'))
+
+    def test_merge_same_zone_category_with_gap(self):
+        events = [RedEvent(2,'restricted_a','attack_attempt','Exploit'),
+                  RedEvent(7,'restricted_a','attack_attempt','Exploit'),
+                  RedEvent(13,'restricted_a','attack_attempt','Exploit')]
+        merged = merge_event_sequences(events, gap=5)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[0]['count'], 2)
+
+    def test_future_windows_are_strictly_future(self):
+        events = [RedEvent(5,'restricted_a','attack_attempt','Exploit')]
+        rows = future_window_labels(events, 12, windows=(3,5), zones=['restricted_a'])
+        by_step = {r['step']: r for r in rows}
+        self.assertEqual(by_step[5]['attack_risk_3'], 0)
+        self.assertEqual(by_step[2]['attack_risk_3'], 1)
+        self.assertEqual(by_step[1]['attack_risk_3'], 0)
+        self.assertEqual(by_step[0]['attack_risk_5'], 1)
+        self.assertEqual(by_step[0]['compromise_risk_5'], 0)
+
+if __name__ == '__main__': unittest.main()

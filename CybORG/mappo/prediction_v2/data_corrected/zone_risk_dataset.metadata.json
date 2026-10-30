@@ -1,0 +1,23 @@
+{
+  "rows": 19800,
+  "episodes_requested": 40,
+  "steps_requested": 100,
+  "zones": [
+    "restricted_a",
+    "operational_a",
+    "restricted_b",
+    "operational_b",
+    "hq"
+  ],
+  "windows": [
+    3,
+    5,
+    10
+  ],
+  "event_merge_gap": 5,
+  "feature_count": 1028,
+  "label_definition": "Future attack attempt, new red session (compromise), or damage within the prediction horizon; scanning is a separate secondary target.",
+  "evaluation_stratum_compromised_is_not_a_feature": true,
+  "label_validity_policy": "A window is valid only when its complete future horizon was observed before episode termination.",
+  "warning": "Validate action target extraction and true-state session schema before trusting collected labels."
+}

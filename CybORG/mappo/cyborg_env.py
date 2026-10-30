@@ -1,47 +1,34 @@
 import inspect
 import enum
-
 import numpy as np
 import CybORG.Shared.Enums as CyEnums
 
-
-
 from CybORG import CybORG
-
 from CybORG.Agents import (
-
     SleepAgent,
-
     EnterpriseGreenAgent,
-
     FiniteStateRedAgent,
-
 )
-
 from CybORG.Simulator.Scenarios.EnterpriseScenarioGenerator import (
-
     EnterpriseScenarioGenerator,
-
 )
 
 
-
-
-
-# Stable semantic input schema for the XAI-ready MAPPO copy.
-# This replaces the old numeric-only flattening, which mostly retained
-# PID/PPID/port values and dropped categorical CybORG enum observations.
 def _build_semantic_feature_names():
-    enum_names = []
+    """Build the stable names used by the 256-dimensional observation encoder."""
     enum_classes = []
     for candidate in vars(CyEnums).values():
         if isinstance(candidate, type):
             try:
-                if issubclass(candidate, enum.Enum) and candidate.__module__ == CyEnums.__name__:
+                if (
+                    issubclass(candidate, enum.Enum)
+                    and candidate.__module__ == CyEnums.__name__
+                ):
                     enum_classes.append(candidate)
             except TypeError:
                 pass
 
+    enum_names = []
     for enum_class in sorted(enum_classes, key=lambda item: item.__name__):
         for member in enum_class:
             enum_names.append(f"enum.{enum_class.__name__}.{member.name}")
@@ -95,8 +82,7 @@ def _build_semantic_feature_names():
         f"structure.field_count.{key}" for key in structural_keys
     ]
 
-    names = enum_names + structure_metrics + structural_names
-    names = names[:256]
+    names = (enum_names + structure_metrics + structural_names)[:256]
     while len(names) < 256:
         names.append(f"padding[{len(names)}]")
     return names
@@ -107,275 +93,81 @@ OBSERVATION_ENCODER_VERSION = "semantic_enum_aggregate_v1"
 
 
 class CybORGMAPPOEnv:
-
-    """
-
-    Adapter between CybORG and our custom MAPPO implementation.
-
-
-
-    - Controls the 5 blue agents
-
-    - Converts CybORG observations into fixed-size vectors
-
-    - Converts discrete MAPPO actions into real CybORG actions
-
-    - Collects rewards
-
-    - Provides action masks for MAPPO evaluation
-
-    """
-
-
-
-    # CybORG high-level actions
+    """Adapter between CybORG and the custom MAPPO implementation."""
 
     ACTION_NAMES = [
-
         "AllowTrafficZone",
-
         "BlockTrafficZone",
-
         "Monitor",
-
         "Analyse",
-
         "Restore",
-
         "Remove",
-
         "DeployDecoy",
-
         "Sleep",
-
     ]
 
-
-
     def __init__(self, steps=100):
-
         self.steps = steps
-
-
-
-        # ---------------------------------------------------------
-
-        # Create CybORG scenario
-
-        # ---------------------------------------------------------
-
-
-
         scenario_generator = EnterpriseScenarioGenerator(
-
             blue_agent_class=SleepAgent,
-
             green_agent_class=EnterpriseGreenAgent,
-
             red_agent_class=FiniteStateRedAgent,
-
             steps=steps,
-
         )
+        self.env = CybORG(scenario_generator=scenario_generator)
 
-
-
-        self.env = CybORG(
-
-            scenario_generator=scenario_generator
-
-        )
-
-
-
-        # ---------------------------------------------------------
-
-        # Blue agents
-
-        # ---------------------------------------------------------
-
-
-
-        self.agent_ids = [
-
+        self.agent_ids = sorted(
             agent_id
-
-            for agent_id in
-
-            self.env.environment_controller.agent_interfaces
-
+            for agent_id in self.env.environment_controller.agent_interfaces
             if agent_id.startswith("blue_agent")
-
-        ]
-
-
-
-        self.agent_ids.sort()
-
-
-
+        )
         self.num_agents = len(self.agent_ids)
-
-
-
-        # ---------------------------------------------------------
-
-        # MAPPO settings
-
-        # ---------------------------------------------------------
-
-
-
-        # Fixed observation size
-
         self.observation_dim = 256
-
-        # Human-readable feature mapping for XAI.
-        # This does not change the MAPPO observation vector.
-        self.feature_names_by_agent = {}
-        # Keep descriptive XAI context separate from MAPPO inputs.
-        self.xai_context_by_agent = {}
-
-
-
-        # 8 high-level actions
-
         self.action_dim = 8
-
-
-
-        # ---------------------------------------------------------
-
-        # Connect secure communication layer
-
-        # ---------------------------------------------------------
-
-
-
+        self.feature_names_by_agent = {}
+        self.xai_context_by_agent = {}
+        self.communication_layer = None
         self._connect_agents_to_communication()
 
-
-
-    # =============================================================
-
+    # -------------------------------------------------------------
     # Communication
-
-    # =============================================================
-
-
+    # -------------------------------------------------------------
 
     def _connect_agents_to_communication(self):
-
-        """
-
-        Connect all CybORG agents to the secure communication
-
-        network already implemented in the project.
-
-        """
-
-
-
+        """Connect agents to the project's secure communication layer, if available."""
         try:
-
-
-
             from CybORG.communication.communication_layer import (
-
-                MultiAgentCommunicationNetwork
-
+                MultiAgentCommunicationNetwork,
             )
-
-
 
             agent_ids = list(
-
-                self.env.environment_controller
-
-                .agent_interfaces.keys()
-
+                self.env.environment_controller.agent_interfaces.keys()
             )
-
-
-
-            self.communication_layer = (
-
-                MultiAgentCommunicationNetwork(agent_ids)
-
-            )
-
-
+            self.communication_layer = MultiAgentCommunicationNetwork(agent_ids)
 
             for agent_interface in (
-
-                self.env.environment_controller
-
-                .agent_interfaces.values()
-
+                self.env.environment_controller.agent_interfaces.values()
             ):
-
-
-
                 agent = agent_interface.agent
-
-
-
-                if hasattr(
-
-                    agent,
-
-                    "set_communication_layer"
-
-                ):
-
-
-
-                    agent.set_communication_layer(
-
-                        self.communication_layer
-
-                    )
-
-
+                if hasattr(agent, "set_communication_layer"):
+                    agent.set_communication_layer(self.communication_layer)
 
         except Exception as error:
-
-
-
             print(
-
-                "Warning: Secure communication layer could not "
-
-                f"be connected: {error}"
-
+                "Warning: Secure communication layer could not be connected: "
+                f"{error}"
             )
-
-
-
             self.communication_layer = None
 
-
-
-    # =============================================================
-    # Observation handling
-    # =============================================================
+    # -------------------------------------------------------------
+    # Observation encoding
+    # -------------------------------------------------------------
 
     def _flatten_observation_with_names(self, observation):
-        """
-        Encode raw CybORG observations into a stable 256-value semantic vector.
-
-        Categorical enum states are represented as presence indicators.
-        Structural counts summarize observed hosts/processes/connections.
-        Raw PIDs, PPIDs, ports, addresses, and arbitrary numeric identifiers
-        are deliberately not copied into the model input.
-
-        IMPORTANT: this encoder is different from the old numeric-only encoder.
-        A checkpoint trained with the old encoder must not be reused; train a
-        new checkpoint in this XAI copy before evaluating it.
-        """
+        """Convert a raw CybORG observation into a stable 256-value vector."""
         names = list(SEMANTIC_FEATURE_NAMES[:self.observation_dim])
         vector = np.zeros(self.observation_dim, dtype=np.float32)
-        index_by_name = {name: index for index, name in enumerate(names)}
+        index_by_name = {name: i for i, name in enumerate(names)}
 
         field_counts = {}
         item_counts = {
@@ -394,8 +186,7 @@ class CybORGMAPPOEnv:
         host_records = []
 
         def normalize_key(key):
-            return "".join(character.lower() for character in str(key)
-                           if character.isalnum())
+            return "".join(ch.lower() for ch in str(key) if ch.isalnum())
 
         def walk(value):
             if isinstance(value, enum.Enum):
@@ -407,12 +198,11 @@ class CybORGMAPPOEnv:
 
             if isinstance(value, dict):
                 for key, child in value.items():
-                    # CybORG observation fields may use Enum dictionary keys.
                     if isinstance(key, enum.Enum):
                         walk(key)
-                    normalized_key = normalize_key(
-                        key.name if isinstance(key, enum.Enum) else key
-                    )
+
+                    key_text = key.name if isinstance(key, enum.Enum) else key
+                    normalized_key = normalize_key(key_text)
                     field_counts[normalized_key] = (
                         field_counts.get(normalized_key, 0) + 1
                     )
@@ -423,7 +213,10 @@ class CybORGMAPPOEnv:
                         elif child is not None:
                             item_counts[normalized_key] += 1
 
-                    if normalized_key == "processes" and isinstance(child, (list, tuple)):
+                    if (
+                        normalized_key == "processes"
+                        and isinstance(child, (list, tuple))
+                    ):
                         process_records.extend(
                             item for item in child if isinstance(item, dict)
                         )
@@ -444,11 +237,16 @@ class CybORGMAPPOEnv:
         if isinstance(observation, dict):
             metadata_keys = {"success", "message", "msg"}
             for key, value in observation.items():
-                if (isinstance(value, dict)
-                        and normalize_key(key) not in metadata_keys):
+                if (
+                    isinstance(value, dict)
+                    and normalize_key(key) not in metadata_keys
+                ):
                     host_records.append(value)
 
         walk(observation)
+
+        def record_has(record, wanted_key):
+            return wanted_key in [normalize_key(key) for key in record]
 
         metric_values = {
             "structure.host_count": len(host_records),
@@ -463,79 +261,61 @@ class CybORGMAPPOEnv:
             "structure.network_connection_count": item_counts["networkconnections"],
             "structure.blocked_ip_count": item_counts["blockedips"],
             "structure.processes_with_process_name_count": sum(
-                "processname" in record for record in process_records
+                record_has(record, "processname") for record in process_records
             ),
             "structure.processes_with_known_process_count": sum(
-                "knownprocess" in [normalize_key(k) for k in record]
-                for record in process_records
+                record_has(record, "knownprocess") for record in process_records
             ),
             "structure.processes_with_program_name_count": sum(
-                "programname" in [normalize_key(k) for k in record]
-                for record in process_records
+                record_has(record, "programname") for record in process_records
             ),
             "structure.processes_with_service_name_count": sum(
-                "servicename" in [normalize_key(k) for k in record]
-                for record in process_records
+                record_has(record, "servicename") for record in process_records
             ),
             "structure.processes_with_username_count": sum(
-                "username" in [normalize_key(k) for k in record]
-                for record in process_records
+                record_has(record, "username") for record in process_records
             ),
             "structure.processes_with_known_path_count": sum(
-                "knownpath" in [normalize_key(k) for k in record]
-                for record in process_records
+                record_has(record, "knownpath") for record in process_records
             ),
             "structure.processes_with_process_type_count": sum(
-                "processtype" in [normalize_key(k) for k in record]
-                for record in process_records
+                record_has(record, "processtype") for record in process_records
             ),
             "structure.processes_with_process_version_count": sum(
-                "processversion" in [normalize_key(k) for k in record]
-                for record in process_records
+                record_has(record, "processversion") for record in process_records
             ),
             "structure.processes_with_status_count": sum(
-                "status" in [normalize_key(k) for k in record]
-                for record in process_records
+                record_has(record, "status") for record in process_records
             ),
             "structure.processes_with_transport_protocol_count": sum(
-                "transportprotocol" in [normalize_key(k) for k in record]
-                for record in process_records
+                record_has(record, "transportprotocol") for record in process_records
             ),
             "structure.processes_with_application_protocol_count": sum(
-                "applicationprotocol" in [normalize_key(k) for k in record]
-                for record in process_records
+                record_has(record, "applicationprotocol") for record in process_records
             ),
             "structure.processes_with_vulnerability_count": sum(
-                "vulnerability" in [normalize_key(k) for k in record]
-                for record in process_records
+                record_has(record, "vulnerability") for record in process_records
             ),
             "structure.hosts_with_system_info_count": sum(
-                "systeminfo" in [normalize_key(k) for k in host]
-                for host in host_records
+                record_has(host, "systeminfo") for host in host_records
             ),
             "structure.hosts_with_interface_count": sum(
-                "interface" in [normalize_key(k) for k in host]
-                for host in host_records
+                record_has(host, "interface") for host in host_records
             ),
             "structure.hosts_with_processes_count": sum(
-                "processes" in [normalize_key(k) for k in host]
-                for host in host_records
+                record_has(host, "processes") for host in host_records
             ),
             "structure.hosts_with_sessions_count": sum(
-                "sessions" in [normalize_key(k) for k in host]
-                for host in host_records
+                record_has(host, "sessions") for host in host_records
             ),
             "structure.hosts_with_files_count": sum(
-                "files" in [normalize_key(k) for k in host]
-                for host in host_records
+                record_has(host, "files") for host in host_records
             ),
             "structure.hosts_with_users_count": sum(
-                "users" in [normalize_key(k) for k in host]
-                for host in host_records
+                record_has(host, "users") for host in host_records
             ),
             "structure.hosts_with_vulnerabilities_count": sum(
-                "vulnerability" in [normalize_key(k) for k in host]
-                for host in host_records
+                record_has(host, "vulnerability") for host in host_records
             ),
         }
 
@@ -544,24 +324,23 @@ class CybORGMAPPOEnv:
             if feature_index is not None:
                 vector[feature_index] = min(float(count), 10.0) / 10.0
 
+        prefix = "structure.field_count."
         for feature_name in names:
-            prefix = "structure.field_count."
             if feature_name.startswith(prefix):
                 key_name = feature_name[len(prefix):]
-                feature_index = index_by_name[feature_name]
-                vector[feature_index] = min(
+                vector[index_by_name[feature_name]] = min(
                     float(field_counts.get(key_name, 0)), 10.0
                 ) / 10.0
 
         return vector, names
 
     def extract_xai_context(self, observation):
-        """Extract descriptive context without changing model inputs."""
+        """Extract descriptive context without changing MAPPO model inputs."""
         context = {}
         keywords = (
             "success", "hostname", "ostype", "osdistribution",
-            "osversion", "architecture", "interface",
-            "ip_address", "subnet", "username", "type",
+            "osversion", "architecture", "interface", "ip_address",
+            "subnet", "username", "type",
         )
         visited = set()
 
@@ -580,325 +359,157 @@ class CybORGMAPPOEnv:
                 return
 
             if isinstance(value, (list, tuple)):
-                for i, item in enumerate(value):
-                    walk(item, f"{path}[{i}]", depth + 1)
+                for index, item in enumerate(value):
+                    walk(item, f"{path}[{index}]", depth + 1)
                 return
 
             if isinstance(value, dict):
-                obj_id = id(value)
-                if obj_id in visited:
+                object_id = id(value)
+                if object_id in visited:
                     return
-                visited.add(obj_id)
+                visited.add(object_id)
                 for key, item in value.items():
                     walk(item, f"{path}.{key}", depth + 1)
                 return
 
-            # Handle CybORG custom objects.
             attributes = getattr(value, "__dict__", None)
             if isinstance(attributes, dict):
-                obj_id = id(value)
-                if obj_id in visited:
+                object_id = id(value)
+                if object_id in visited:
                     return
-                visited.add(obj_id)
+                visited.add(object_id)
                 for key, item in attributes.items():
                     if not key.startswith("_"):
                         walk(item, f"{path}.{key}", depth + 1)
 
         walk(observation)
         return context
-    
-    
+
     def get_xai_context(self, agent_id):
         """Return context captured from the original CybORG observation."""
         return dict(self.xai_context_by_agent.get(agent_id, {}))
 
-
     def _flatten_observation(self, observation):
-        """
-        Backward-compatible wrapper.
-
-        Returns only the numeric vector, exactly as before.
-        """
+        """Backward-compatible helper that returns only the numeric vector."""
         values, _ = self._flatten_observation_with_names(observation)
         return values
 
     def _process_observation(self, observation, agent_id=None):
-        """
-        Convert a raw CybORG observation into the same fixed-size
-        256-dimensional vector used by the trained MAPPO model.
-
-        Also store the raw-observation path corresponding to each
-        vector position for XAI.
-
-        IMPORTANT:
-        The numeric observation itself is unchanged.
-        """
-        # Extract semantic context from the ORIGINAL observation,
-        # before it becomes a numeric NumPy array.
+        """Encode an observation and store feature names/context for XAI."""
         if agent_id is not None:
-            self.xai_context_by_agent[agent_id] = (
-                self.extract_xai_context(observation)
+            self.xai_context_by_agent[agent_id] = self.extract_xai_context(
+                observation
             )
-        vector, names = self._flatten_observation_with_names(
-            observation
-        )
+
+        vector, names = self._flatten_observation_with_names(observation)
+
         if agent_id == "blue_agent_0":
-            active = int(np.count_nonzero(vector))
             print(
-                f"[SEMANTIC FEATURE AUDIT] active features: {active}; "
+                "[SEMANTIC FEATURE AUDIT] active features: "
+                f"{int(np.count_nonzero(vector))}; "
                 f"model input size: {self.observation_dim}"
             )
 
         if len(vector) < self.observation_dim:
-
             padding_count = self.observation_dim - len(vector)
-
-            vector = np.pad(
-                vector,
-                (
-                    0,
-                    padding_count
-                ),
-                mode="constant"
-            )
-
+            vector = np.pad(vector, (0, padding_count), mode="constant")
             names.extend(
-                [
-                    f"padding[{i}]"
-                    for i in range(padding_count)
-                ]
+                f"padding[{i}]"
+                for i in range(padding_count)
             )
-
         elif len(vector) > self.observation_dim:
-
             vector = vector[:self.observation_dim]
             names = names[:self.observation_dim]
 
-        if not hasattr(self, "feature_names_by_agent"):
-            self.feature_names_by_agent = {}
-
-        if agent_id is not None:
-            self.feature_names_by_agent[agent_id] = names
-
+        self.feature_names_by_agent[agent_id] = names
         return vector.astype(np.float32)
 
     def get_feature_names(self, agent_id):
-        """
-        Return feature names for the current 256-D observation
-        of the requested agent.
-        """
-
-        if not hasattr(self, "feature_names_by_agent"):
-            self.feature_names_by_agent = {}
-
-        names = list(
-            self.feature_names_by_agent.get(agent_id, [])
-        )
-
+        """Return the 256 feature names for an agent."""
+        names = list(self.feature_names_by_agent.get(agent_id, []))
         if len(names) < self.observation_dim:
             names.extend(
-                [
-                    f"padding[{i}]"
-                    for i in range(
-                        len(names),
-                        self.observation_dim
-                    )
-                ]
+                f"padding[{i}]"
+                for i in range(len(names), self.observation_dim)
             )
-
         return names[:self.observation_dim]
 
-
-
-
-    # =============================================================
-
+    # -------------------------------------------------------------
     # Reset
-
-    # =============================================================
-
-
+    # -------------------------------------------------------------
 
     def reset(self):
-
-        """
-
-        Reset CybORG and return processed observations.
-
-        """
-
-
-
+        """Reset CybORG and return processed observations."""
         results = self.env.reset()
-
-
-
-        # Reconnect communication after reset
-
         self._connect_agents_to_communication()
-
-
-
         observations = {}
 
-
-
         for agent_id in self.agent_ids:
-
-
-
             try:
-
-
-
-                # CybORG reset() returns a Results object.
-
-                # The actual observations are stored here.
-
                 raw_observation = self.env.get_observation(agent_id)
-
-
-
-                observations[agent_id] = (
-
-                    self._process_observation(
-
-                        raw_observation,
-
-                        agent_id
-
-                    )
-
+                observations[agent_id] = self._process_observation(
+                    raw_observation, agent_id
                 )
-
-
-
-            # except Exception:
-
-
-
-            #     # If an observation is unavailable,
-
-            #     # use a zero vector.
-
-
-
-            #     observations[agent_id] = np.zeros(
-
-            #         self.observation_dim,
-
-            #         dtype=np.float32
-
-            #     )
-
-            #     self.feature_names_by_agent[agent_id] = [
-            #         f"missing_observation[{k}]"
-            #         for k in range(self.observation_dim)
-            #     ]
-
-            # except Exception as error:
-            #     print(
-            #         f"[OBSERVATION ERROR] {agent_id}: "
-            #         f"{type(error).__name__}: {error}"
-            #     )
-
-            #     observations[agent_id] = np.zeros(
-            #         self.observation_dim,
-            #         dtype=np.float32
-            #     )
-
-            #     self.feature_names_by_agent[agent_id] = [
-            #         f"missing_observation[{k}]"
-            #         for k in range(self.observation_dim)
-            #     ]
             except Exception as error:
                 print(
                     f"[OBSERVATION ERROR] {agent_id}: "
                     f"{type(error).__name__}: {error}"
                 )
-                
+                result_observation = getattr(results, "observation", None)
                 print(
                     "[OBSERVATION DEBUG] "
-                    f"agent_id={agent_id!r}, "
                     f"results_type={type(results).__name__}, "
-                    f"observation_type={type(results.observation).__name__}, "
-                    f"observation_keys="
-                    f"{list(results.observation.keys())[:30] if isinstance(results.observation, dict) else 'not a dictionary'}"
+                    f"observation_type={type(result_observation).__name__}, "
+                    "observation_keys="
+                    f"{list(result_observation.keys())[:30] if isinstance(result_observation, dict) else 'not a dictionary'}"
                 )
-
-
                 observations[agent_id] = np.zeros(
-                    self.observation_dim,
-                    dtype=np.float32
+                    self.observation_dim, dtype=np.float32
                 )
                 self.xai_context_by_agent[agent_id] = {}
                 self.feature_names_by_agent[agent_id] = [
-                    f"missing_observation[{k}]"
-                    for k in range(self.observation_dim)
+                    f"missing_observation[{i}]"
+                    for i in range(self.observation_dim)
                 ]
 
         return observations
 
-
-
-    # =============================================================
-
+    # -------------------------------------------------------------
     # Agent information
-
-    # =============================================================
-
-
+    # -------------------------------------------------------------
 
     def get_agent_ids(self):
-
         return self.agent_ids
 
-
-
     def get_num_agents(self):
-
         return self.num_agents
 
-
-
     def get_observation_dim(self):
-
         return self.observation_dim
 
-
-
     def get_action_dim(self):
-
         return self.action_dim
 
-
-
-    # =============================================================
-
-    # ACTION MASK
-
-    # =============================================================
-
-
+    # -------------------------------------------------------------
+    # Action progress and masks
+    # -------------------------------------------------------------
 
     def is_action_in_progress(self, agent_id):
-        """Return True when CybORG is still executing this agent's prior action.
-
-        During multi-tick actions, CybORG emits an IN_PROGRESS observation and
-        does not accept a replacement action from the wrapper. The current
-        MAPPO output at that timestep is therefore not a newly executed choice.
-        """
+        """Return whether CybORG has an action in progress for this agent."""
         try:
-            controller = self.env.environment_controller
-            progress = controller.actions_in_progress.get(agent_id)
+            progress = (
+                self.env.environment_controller.actions_in_progress.get(agent_id)
+            )
             return progress is not None
         except (AttributeError, TypeError):
             return False
 
     def get_in_progress_action_name(self, agent_id):
-        """Get the class name of an action that is still being executed."""
+        """Return the class name of an action currently in progress."""
         try:
-            progress = self.env.environment_controller.actions_in_progress.get(agent_id)
+            progress = (
+                self.env.environment_controller.actions_in_progress.get(agent_id)
+            )
             if progress is None:
                 return ""
             action = progress.get("action") if isinstance(progress, dict) else None
@@ -907,1426 +518,284 @@ class CybORGMAPPOEnv:
             return ""
 
     def get_action_mask(self, agent_id):
-
-        """
-
-        Return a mask indicating which high-level actions
-
-        are currently available to the specified agent.
-
-
-
-        1 = action available
-
-        0 = action unavailable
-
-        """
-
-
-
-        mask = np.zeros(
-
-            self.action_dim,
-
-            dtype=np.float32
-
-        )
-
-
-
+        """Return a mask of currently available high-level actions."""
+        mask = np.zeros(self.action_dim, dtype=np.float32)
         try:
-
-
-
-            action_space = self.env.get_action_space(
-
-                agent_id
-
-            )
-
-
-
-            available_actions = action_space.get(
-
-                "action",
-
-                {}
-
-            )
-
-
-
-            # Compare every high-level action with the
-
-            # action classes currently available in CybORG.
-
-
-
-            for index, action_name in enumerate(
-
-                self.ACTION_NAMES
-
-            ):
-
-
-
+            action_space = self.env.get_action_space(agent_id)
+            available_actions = action_space.get("action", {})
+            for index, action_name in enumerate(self.ACTION_NAMES):
                 for action_class in available_actions.keys():
-
-
-
-                    if (
-
-                        action_class.__name__
-
-                        == action_name
-
-                    ):
-
-
-
+                    if getattr(action_class, "__name__", "") == action_name:
                         mask[index] = 1.0
-
                         break
-
-
-
         except Exception as error:
-
-
-
             print(
-
-                f"Warning: Could not generate action mask "
-
-                f"for {agent_id}: {error}"
-
+                f"Warning: Could not generate action mask for {agent_id}: {error}"
             )
 
-
-
-        # Sleep should always be available.
-
+        # Keep Sleep as a safe fallback action.
         mask[7] = 1.0
-
-
-
         return mask
 
-
-
-    # =============================================================
-
-    # Action class
-
-    # =============================================================
-
-
-
-    def _find_action_class(
-
-        self,
-
-        agent_id,
-
-        action_name
-
-    ):
-
-        """
-
-        Find the actual CybORG action class.
-
-
-
-        CybORG stores action classes as dictionary keys.
-
-        """
-
-
-
+    def _find_action_class(self, agent_id, action_name):
+        """Find a CybORG action class in the agent's current action space."""
         try:
-
-
-
-            action_space = (
-
-                self.env.get_action_space(
-
-                    agent_id
-
-                )
-
-            )
-
-
-
-            action_options = action_space.get(
-
-                "action",
-
-                {}
-
-            )
-
-
-
-            for action_class in action_options.keys():
-
-
-
-                if (
-
-                    action_class.__name__
-
-                    == action_name
-
-                ):
-
-
-
+            action_space = self.env.get_action_space(agent_id)
+            for action_class in action_space.get("action", {}).keys():
+                if getattr(action_class, "__name__", "") == action_name:
                     return action_class
-
-
-
         except Exception:
-
-
-
             pass
-
-
-
         return None
 
+    # -------------------------------------------------------------
+    # Action parameter selection
+    # -------------------------------------------------------------
 
-
-    # =============================================================
-
-    # Parameter selection
-
-    # =============================================================
-
-
-
-    def _get_parameter_value(
-
-        self,
-
-        parameter_values
-
-    ):
-
-        """
-
-        Select the first currently valid parameter.
-
-        """
-
-
-
-        if not isinstance(
-
-            parameter_values,
-
-            dict
-
-        ):
-
-
-
+    @staticmethod
+    def _get_parameter_value(parameter_values):
+        """Select the first enabled parameter value."""
+        if not isinstance(parameter_values, dict):
             return None
-
-
-
         for value, enabled in parameter_values.items():
-
-
-
             if enabled:
-
                 return value
-
-
-
         return None
 
-
-
-    def _build_action_parameters(
-
-        self,
-
-        agent_id,
-
-        action_class
-
-    ):
-
-        """
-
-        Build valid parameters required by a CybORG action.
-
-        """
-
-
-
+    def _build_action_parameters(self, agent_id, action_class):
+        """Build required parameters using the current CybORG action space."""
         parameters = {}
 
-
-
-        # ---------------------------------------------------------
-
-        # Get action space
-
-        # ---------------------------------------------------------
-
-
-
         try:
-
-
-
-            action_space = self.env.get_action_space(
-
-                agent_id
-
-            )
-
-
-
+            action_space = self.env.get_action_space(agent_id)
         except Exception:
-
-
-
             return parameters
-
-
-
-        # ---------------------------------------------------------
-
-        # Get action signature
-
-        # ---------------------------------------------------------
-
-
 
         try:
-
-
-
-            signature = inspect.signature(
-
-                action_class
-
-            )
-
-
-
-        except (
-
-            TypeError,
-
-            ValueError
-
-        ):
-
-
-
+            signature = inspect.signature(action_class)
+        except (TypeError, ValueError):
             return parameters
-
-
-
-        # ---------------------------------------------------------
-
-        # Helper: get first valid value
-
-        # ---------------------------------------------------------
-
-
 
         def first_valid(space):
-
-
-
             if not isinstance(space, dict):
-
                 return None
-
-
-
             for value, enabled in space.items():
-
-
-
                 if enabled:
-
                     return value
-
-
-
             return None
 
-
-
-        # ---------------------------------------------------------
-
-        # Get available values
-
-        # ---------------------------------------------------------
-
-
-
-        session = first_valid(
-
-            action_space.get(
-
-                "session",
-
-                {}
-
-            )
-
-        )
-
-
-
-        agent = first_valid(
-
-            action_space.get(
-
-                "agent",
-
-                {}
-
-            )
-
-        )
-
-
-
-        subnet = first_valid(
-
-            action_space.get(
-
-                "subnet",
-
-                {}
-
-            )
-
-        )
-
-
-
-        hostname = first_valid(
-
-            action_space.get(
-
-                "hostname",
-
-                {}
-
-            )
-
-        )
-
-
-
-        # ---------------------------------------------------------
-
-        # Traffic actions
-
-        # ---------------------------------------------------------
-
-
-
-        if action_class.__name__ in (
-
-            "AllowTrafficZone",
-
-            "BlockTrafficZone"
-
-        ):
-
-
-
-            parameters["session"] = (
-
-                session
-
-                if session is not None
-
-                else 0
-
-            )
-
-
-
-            parameters["agent"] = (
-
-                agent
-
-                if agent is not None
-
-                else agent_id
-
-            )
-
-
-
+        session = first_valid(action_space.get("session", {}))
+        agent = first_valid(action_space.get("agent", {}))
+        subnet = first_valid(action_space.get("subnet", {}))
+        hostname = first_valid(action_space.get("hostname", {}))
+
+        if action_class.__name__ in ("AllowTrafficZone", "BlockTrafficZone"):
+            parameters["session"] = session if session is not None else 0
+            parameters["agent"] = agent if agent is not None else agent_id
             if subnet is not None:
-
-
-
                 parameters["from_subnet"] = subnet
-
-
-
                 parameters["to_subnet"] = subnet
-
-
-
             return parameters
 
-
-
-        # ---------------------------------------------------------
-
-        # Normal actions
-
-        # ---------------------------------------------------------
-
-
-
-        for (
-
-            parameter_name,
-
-            parameter
-
-        ) in signature.parameters.items():
-
-
-
+        for parameter_name, parameter in signature.parameters.items():
             if parameter_name == "self":
-
                 continue
-
-
-
-            # Parameter has a default value
-
-            if (
-
-                parameter.default
-
-                is not inspect.Parameter.empty
-
-            ):
-
-
-
+            if parameter.default is not inspect.Parameter.empty:
                 continue
-
-
 
             if parameter_name == "session":
-
-
-
-                parameters["session"] = (
-
-                    session
-
-                    if session is not None
-
-                    else 0
-
-                )
-
-
-
+                parameters["session"] = session if session is not None else 0
             elif parameter_name == "agent":
-
-
-
-                parameters["agent"] = (
-
-                    agent
-
-                    if agent is not None
-
-                    else agent_id
-
-                )
-
-
-
-            elif parameter_name == "hostname":
-
-
-
-                if hostname is not None:
-
-
-
-                    parameters["hostname"] = hostname
-
-
+                parameters["agent"] = agent if agent is not None else agent_id
+            elif parameter_name == "hostname" and hostname is not None:
+                parameters["hostname"] = hostname
 
         return parameters
 
-
-
-    # =============================================================
-
-    # Create CybORG action
-
-    # =============================================================
-
-
-
-    def _create_cyborg_action(
-
-        self,
-
-        agent_id,
-
-        action_index
-
-    ):
-
-        """
-
-        Convert a discrete MAPPO action index
-
-        into a real CybORG action object.
-
-        """
-
-
-
-        # Make sure action is valid
-
+    def _create_cyborg_action(self, agent_id, action_index):
+        """Convert a discrete MAPPO action index into a CybORG action object."""
         action_index = int(action_index)
+        action_index = max(0, min(action_index, self.action_dim - 1))
+        action_name = self.ACTION_NAMES[action_index]
+        action_class = self._find_action_class(agent_id, action_name)
 
-
-
-        if action_index < 0:
-
-            action_index = 0
-
-
-
-        if action_index >= self.action_dim:
-
-            action_index = self.action_dim - 1
-
-
-
-        action_name = (
-
-            self.ACTION_NAMES[
-
-                action_index
-
-            ]
-
-        )
-
-
-
-        # ---------------------------------------------------------
-
-        # Find actual CybORG action class
-
-        # ---------------------------------------------------------
-
-
-
-        action_class = self._find_action_class(
-
-            agent_id,
-
-            action_name
-
-        )
-
-
-
-        # ---------------------------------------------------------
-
-        # If unavailable -> Sleep
-
-        # ---------------------------------------------------------
-
-
-
-        # if action_class is None:
-
-
-
-        #     sleep_class = self._find_action_class(
-
-        #         agent_id,
-
-        #         "Sleep"
-
-        #     )
-
-
-
-        #     if sleep_class is not None:
-
-
-
-        #         try:
-
-
-
-        #             return sleep_class()
-
-
-
-        #         except Exception:
-
-
-
-        #             pass
-
-        #changed here fallback if action is none:
-
-        
         if action_class is None:
             print(
-                f"[ACTION FALLBACK] {agent_id}: "
-                f"{action_name} unavailable; using Sleep"
+                f"[ACTION FALLBACK] {agent_id}: {action_name} unavailable; "
+                "using Sleep"
             )
-
-            sleep_class = self._find_action_class(
-                agent_id,
-                "Sleep"
-            )
-
+            sleep_class = self._find_action_class(agent_id, "Sleep")
             if sleep_class is not None:
                 try:
                     return sleep_class()
                 except Exception:
                     pass
-        
-        
-        
-        
             return None
 
-
-
-        # ---------------------------------------------------------
-
-        # Build parameters
-
-        # ---------------------------------------------------------
-
-
-
-        action_parameters = (
-
-            self._build_action_parameters(
-
-                agent_id,
-
-                action_class
-
-            )
-
+        action_parameters = self._build_action_parameters(
+            agent_id, action_class
         )
-
-
-
-        # ---------------------------------------------------------
-
-        # Create action
-
-        # ---------------------------------------------------------
-
-
-
         try:
-
-
-
-            return action_class(
-
-                **action_parameters
-
-            )
-
-
-
-        except Exception:
-
+            return action_class(**action_parameters)
+        except Exception as error:
             print(
-                f"[ACTION FALLBACK] {agent_id}: "
-                f"Could not construct {action_name}; using Sleep"
+                f"[ACTION FALLBACK] {agent_id}: could not construct "
+                f"{action_name} ({error}); using Sleep"
             )
-
-            # If parameter construction fails,
-
-            # use Sleep instead.
-
-
-
-            sleep_class = self._find_action_class(
-
-                agent_id,
-
-                "Sleep"
-
-            )
-
-
-
+            sleep_class = self._find_action_class(agent_id, "Sleep")
             if sleep_class is not None:
-
-
-
                 try:
-
-
-
                     return sleep_class()
-
-
-
                 except Exception:
-
-
-
                     pass
-
-
-
             return None
 
-
-
-    # =============================================================
-
+    # -------------------------------------------------------------
     # Reward processing
-
-    # =============================================================
-
-
+    # -------------------------------------------------------------
 
     def _process_reward(self, reward):
-
-        """
-
-        Convert CybORG reward output into a single float.
-
-        """
-
-
-
-        # Direct number
-
-        if isinstance(
-
-            reward,
-
-            (
-
-                int,
-
-                float,
-
-                np.integer,
-
-                np.floating
-
-            )
-
-        ):
-
-
-
+        """Convert a CybORG reward into one float."""
+        if isinstance(reward, (int, float, np.integer, np.floating)):
             return float(reward)
 
-
-
-        # Dictionary of reward components
-
-        if isinstance(
-
-            reward,
-
-            dict
-
-        ):
-
-
-
+        if isinstance(reward, dict):
             total = 0.0
-
-
-
             for value in reward.values():
-
-
-
-                if isinstance(
-
-                    value,
-
-                    (
-
-                        int,
-
-                        float,
-
-                        np.integer,
-
-                        np.floating
-
-                    )
-
-                ):
-
-
-
+                if isinstance(value, (int, float, np.integer, np.floating)):
                     total += float(value)
-
-
-
             return total
-
-
 
         return 0.0
 
-
-
-    # =============================================================
-
+    # -------------------------------------------------------------
     # Step
-
-    # =============================================================
-
-
+    # -------------------------------------------------------------
 
     def step(self, actions):
-
         """
-
         Execute one multi-agent step.
 
-
-
-        Input:
-
-            actions = {
-
-                "blue_agent_0": 3,
-
-                "blue_agent_1": 7,
-
-                ...
-
-            }
-
-
-
-        Output:
-
-            observations
-
-            rewards
-
-            terminated
-
-            info
-
+        Returns:
+            observations, rewards, terminated, infos
         """
-
-
-
-        # ---------------------------------------------------------
-
-        # Convert MAPPO actions into CybORG actions
-
-        # ---------------------------------------------------------
-
-
-
         cyborg_actions = {}
-
-
-
         for agent_id in self.agent_ids:
-
-
-
-            action_index = actions.get(
-
-                agent_id,
-
-                7
-
-            )
-
-
-
-            action = self._create_cyborg_action(
-
-                agent_id,
-
-                action_index
-
-            )
-
-
-
+            action_index = actions.get(agent_id, 7)
+            action = self._create_cyborg_action(agent_id, action_index)
             if action is not None:
-
-
-
-                cyborg_actions[
-
-                    agent_id
-
-                ] = action
-
-
-
-        # ---------------------------------------------------------
-
-        # Execute CybORG step
-
-        # ---------------------------------------------------------
-
-
-
-        # result = self.env.parallel_step(
-
-        #     actions=cyborg_actions
-
-        # )
-
-        
-        result = self.env.parallel_step(
-            actions=cyborg_actions
-        )
-
-        # print(
-        #     "[REWARD DEBUG]",
-        #     type(raw_rewards).__name__,
-        #     repr(raw_rewards)
-        # )
-
-
-        # ---------------------------------------------------------
-
-        # Handle CybORG result
-
-        # ---------------------------------------------------------
-
-
-
-        if isinstance(
-
-            result,
-
-            tuple
-
-        ):
-
-
-
-            if len(result) == 4:
-
-
-
-                (
-
-                    raw_observations,
-
-                    raw_rewards,
-
-                    dones,
-
-                    infos
-
-                ) = result
-
-
-
-            elif len(result) == 3:
-
-
-
-                (
-
-                    raw_observations,
-
-                    raw_rewards,
-
-                    dones
-
-                ) = result
-
-
-
-                infos = {}
-
-
-
-            else:
-
-
-
-                raw_observations = result[0]
-
-                raw_rewards = result[1]
-
-                dones = result[2]
-
-                infos = {}
-
-
-
-        else:
-
-
-
-            raw_observations = {}
-
-            raw_rewards = {}
-
-            dones = False
-
+                cyborg_actions[agent_id] = action
+
+        result = self.env.parallel_step(actions=cyborg_actions)
+
+        # Parse the documented tuple shapes without using uninitialized locals.
+        if not isinstance(result, tuple):
+            raise TypeError(
+                "Expected CybORG parallel_step() to return a tuple, "
+                f"received {type(result).__name__}"
+            )
+
+        if len(result) == 4:
+            raw_observations, raw_rewards, dones, infos = result
+        elif len(result) == 3:
+            raw_observations, raw_rewards, dones = result
             infos = {}
+        else:
+            raise ValueError(
+                f"Unexpected CybORG parallel_step() tuple length: {len(result)}"
+            )
 
-        # ---------------------------------------------------------
+        if not isinstance(raw_observations, dict):
+            raise TypeError(
+                "CybORG observations should be a dictionary, received "
+                f"{type(raw_observations).__name__}"
+            )
 
-        # Process observations
+        # Diagnostic: show what parallel_step actually returned.
+        # Remove this block after the observation investigation is complete.
+        if getattr(self, "debug_observations", True):
+            print("\n========== PARALLEL_STEP OBSERVATION CHECK ==========")
+            for agent_id in self.agent_ids:
+                raw_obs = raw_observations.get(agent_id, {})
+                if not isinstance(raw_obs, dict):
+                    print(
+                        f"\nAgent: {agent_id}; unexpected observation type: "
+                        f"{type(raw_obs).__name__}"
+                    )
+                    continue
 
-        # ---------------------------------------------------------
-
-
+                excluded_keys = {"success", "action", "message", "msg"}
+                host_keys = [
+                    key for key, value in raw_obs.items()
+                    if key not in excluded_keys and isinstance(value, dict)
+                ]
+                print(f"\nAgent: {agent_id}")
+                print("Raw observation keys:", list(raw_obs.keys()))
+                print("Host record count:", len(host_keys))
+                print("Host names:", host_keys[:5])
+                print(
+                    "Action in progress:",
+                    self.is_action_in_progress(agent_id)
+                )
+            print("=====================================================\n")
 
         observations = {}
-
-
-
         for agent_id in self.agent_ids:
-
-
-
             if agent_id in raw_observations:
-
-
-
-                observations[agent_id] = (
-
-                    self._process_observation(
-
-                        raw_observations[
-
-                            agent_id
-
-                        ],
-
-                        agent_id
-
-                    )
-
+                observations[agent_id] = self._process_observation(
+                    raw_observations[agent_id], agent_id
                 )
-
-
-
             else:
-
-
-
                 observations[agent_id] = np.zeros(
-
-                    self.observation_dim,
-
-                    dtype=np.float32
-
+                    self.observation_dim, dtype=np.float32
                 )
-
                 self.xai_context_by_agent[agent_id] = {}
                 self.feature_names_by_agent[agent_id] = [
-                    f"missing_observation[{k}]"
-                    for k in range(self.observation_dim)
+                    f"missing_observation[{i}]"
+                    for i in range(self.observation_dim)
                 ]
 
-
-
-        # ---------------------------------------------------------
-
-        # Process rewards
-
-        # ---------------------------------------------------------
-
-
-
         rewards = {}
-
-
-
         for agent_id in self.agent_ids:
-
-
-
-            if isinstance(
-
-                raw_rewards,
-
-                dict
-
-            ):
-
-
-
-                rewards[agent_id] = (
-
-                    self._process_reward(
-
-                        raw_rewards.get(
-
-                            agent_id,
-
-                            0.0
-
-                        )
-
-                    )
-
+            if isinstance(raw_rewards, dict):
+                rewards[agent_id] = self._process_reward(
+                    raw_rewards.get(agent_id, 0.0)
                 )
-
-
-
             else:
+                rewards[agent_id] = self._process_reward(raw_rewards)
 
-
-
-                rewards[agent_id] = (
-
-                    self._process_reward(
-
-                        raw_rewards
-
-                    )
-
-                )
-
-
-
-        # ---------------------------------------------------------
-
-        # Process termination
-
-        # ---------------------------------------------------------
-
-
-
-        if isinstance(
-
-            dones,
-
-            dict
-
-        ):
-
-
-
-            terminated = any(
-
-                bool(value)
-
-                for value in dones.values()
-
-            )
-
-
-
+        if isinstance(dones, dict):
+            terminated = any(bool(value) for value in dones.values())
         else:
+            terminated = bool(dones)
 
+        return observations, rewards, terminated, infos
 
-
-            terminated = bool(
-
-                dones
-
-            )
-
-
-
-        return (
-
-            observations,
-
-            rewards,
-
-            terminated,
-
-            infos
-
-        )
-
-
-
-    # =============================================================
-
+    # -------------------------------------------------------------
     # Close
-
-    # =============================================================
-
-
+    # -------------------------------------------------------------
 
     def close(self, **kwargs):
-
-        """
-
-        CybORG CC4 environment does not require GUI cleanup.
-
-        """
-
-
-
-        return
-
-
-
-
-
-# =============================================================
-
-# Direct test
-
-# =============================================================
-
+        """Close hook; this CybORG adapter has no GUI resources to release."""
+        return None
 
 
 if __name__ == "__main__":
+    print("===== CybORG MAPPO ENV TEST =====")
+    env = CybORGMAPPOEnv(steps=10)
 
+    print("Agents:", env.get_agent_ids())
+    print("Number of agents:", env.get_num_agents())
+    print("Observation dimension:", env.get_observation_dim())
+    print("Action dimension:", env.get_action_dim())
 
-
-    print(
-
-        "===== CybORG MAPPO ENV TEST ====="
-
-    )
-
-
-
-    env = CybORGMAPPOEnv(
-
-        steps=10
-
-    )
-
-
-
-    print(
-
-        "Agents:",
-
-        env.get_agent_ids()
-
-    )
-
-
-
-    print(
-
-        "Number of agents:",
-
-        env.get_num_agents()
-
-    )
-
-
-
-    print(
-
-        "Observation dimension:",
-
-        env.get_observation_dim()
-
-    )
-
-
-
-    print(
-
-        "Action dimension:",
-
-        env.get_action_dim()
-
-    )
-
-
-
-    # Test action masks
-
-    print(
-
-        "\nAction masks:"
-
-    )
-
-
-
+    print("\nAction masks:")
     for agent_id in env.get_agent_ids():
-
-
-
-        print(
-
-            agent_id,
-
-            env.get_action_mask(agent_id)
-
-        )
-
-
+        print(agent_id, env.get_action_mask(agent_id))
 
     observations = env.reset()
-
-
-
-    print(
-
-        "\nObservation shapes:"
-
-    )
-
-
-
+    print("\nObservation shapes:")
     for agent_id in env.get_agent_ids():
+        print(agent_id, observations[agent_id].shape)
 
-
-
-        print(
-
-            agent_id,
-
-            observations[
-
-                agent_id
-
-            ].shape
-
-        )
-
-
-
-    print(
-
-        "\n===== ENV TEST PASSED ====="
-
-    )
-
+    print("\n===== ENV TEST PASSED =====")

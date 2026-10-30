@@ -1,0 +1,35 @@
+"""Small inference API. Call with one agent's observation only."""
+from pathlib import Path
+import joblib
+import numpy as np
+from .features import zone_features
+from .config import MODEL_DIR
+
+class ZoneRiskPredictor:
+    def __init__(self, model_path):
+        pack = joblib.load(model_path)
+        self.model = pack["model"]
+        self.columns = pack["feature_columns"]
+        self.window = int(pack["window"])
+        self.target = pack["target"]
+        self.zone = None
+        self.history = []
+
+    def predict(self, observation, zone, step, episode_steps=100):
+        if self.zone != zone:
+            self.zone = zone; self.history = []
+        vector = zone_features(observation, zone, step, episode_steps, self.history)
+        self.history.append(np.asarray(observation, dtype=np.float32).copy())
+        self.history = self.history[-5:]
+        if len(vector) != len(self.columns):
+            raise ValueError(f"Model expects {len(self.columns)} features, runtime adapter produced {len(vector)}")
+        import pandas as pd
+
+        # Preserve the exact feature names and order used during training.
+        frame = pd.DataFrame(
+            vector.reshape(1, -1),
+            columns=self.columns,
+        )
+        p = self.model.predict_proba(frame)[0]
+        classes = list(self.model.classes_)
+        return float(p[classes.index(1)]) if 1 in classes else 0.0

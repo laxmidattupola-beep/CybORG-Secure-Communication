@@ -1,0 +1,33 @@
+from __future__ import annotations
+import argparse
+from pathlib import Path
+import pandas as pd
+from .config import DATA_DIR, MODEL_DIR
+from .models import metrics_for, feature_columns, _safe_probability
+import joblib
+
+def main():
+    p = argparse.ArgumentParser(description="Recompute held-out metrics from saved episode split")
+    p.add_argument("--dataset", type=Path, default=DATA_DIR / "zone_risk_dataset.csv")
+    p.add_argument("--models-dir", type=Path, default=MODEL_DIR)
+    args = p.parse_args()
+    frame = pd.read_csv(args.dataset)
+    import json
+    split = json.loads((args.models_dir / "episode_split.json").read_text(encoding="utf-8"))
+    test_all = frame[frame.episode_id.isin(split["test"])].copy()
+    reports = []
+    for path in sorted(args.models_dir.glob("*.joblib")):
+        pack = joblib.load(path); target = pack["target"]
+        valid_column = pack.get("label_validity_column")
+        if not valid_column or valid_column not in test_all.columns:
+            raise ValueError(f"Missing label-validity column {valid_column}; recollect the dataset and retrain")
+        model_test = test_all[test_all[valid_column].astype(bool)].copy()
+        if model_test.empty:
+            print(f"Skipping {path.name}: no complete future windows in held-out episodes")
+            continue
+        X = model_test[pack["feature_columns"]].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        prob = _safe_probability(pack["model"], X)
+        reports.append({"model_file": path.name, **metrics_for(model_test[target].astype(int), prob)})
+    result = pd.DataFrame(reports); out = args.models_dir / "evaluation_recheck.csv"; result.to_csv(out, index=False)
+    print(result.to_string(index=False)); print(f"Saved {out.resolve()}")
+if __name__ == "__main__": main()

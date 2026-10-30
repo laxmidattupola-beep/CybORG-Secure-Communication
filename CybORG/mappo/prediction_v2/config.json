@@ -1,0 +1,11 @@
+{
+  "episode_steps": 100,
+  "windows": [3, 5, 10],
+  "event_merge_gap": 5,
+  "random_seed": 42,
+  "min_episodes": 10,
+  "test_size": 0.2,
+  "validation_size": 0.2,
+  "history_steps": 5,
+  "zone_local_runtime_risk": true
+}

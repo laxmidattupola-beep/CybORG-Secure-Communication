@@ -1,0 +1,204 @@
+"""Ground-truth event classification, zone mapping, merging and future labels."""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Iterable, Optional
+import ipaddress
+from .config import ATTACK_ACTIONS, DAMAGE_ACTIONS, SCAN_ACTIONS, ZONE_HOST_TOKENS
+
+@dataclass(frozen=True)
+class RedEvent:
+    step: int
+    zone: str
+    category: str  # scan, attack_attempt, compromise, damage
+    source: str
+    host: Optional[str] = None
+    success: Optional[bool] = None
+
+
+def zone_for_host(hostname: str) -> Optional[str]:
+    name = str(hostname).lower()
+    for zone, tokens in ZONE_HOST_TOKENS.items():
+        if any(token in name for token in tokens):
+            return zone
+    return None
+
+
+# Live subnet inventory, refreshed by the collector after each reset.
+_SUBNET_ZONE_INDEX = []
+
+
+def set_subnet_inventory(subnets):
+    """Register live simulator subnets for dynamic IP/CIDR target resolution."""
+    global _SUBNET_ZONE_INDEX
+    index = []
+    if not isinstance(subnets, dict):
+        raise TypeError("Expected the simulator's subnet inventory as a dictionary")
+
+    for key, subnet in subnets.items():
+        name = getattr(subnet, "name", None)
+        cidr = getattr(subnet, "cidr", None) or key
+        zone = zone_for_host(name) if name is not None else None
+        if zone is None:
+            continue  # Contractor and internet remain unmapped.
+        try:
+            network = ipaddress.ip_network(str(cidr), strict=False)
+        except ValueError:
+            continue
+        index.append((network, zone))
+
+    _SUBNET_ZONE_INDEX = index
+
+
+def resolve_zone_for_target(target) -> Optional[str]:
+    """Resolve a hostname, IP address, or CIDR using current live subnet data."""
+    if target is None:
+        return None
+
+    value = str(target).strip()
+    if not value:
+        return None
+
+    # Preserve the established hostname-token mapping first.
+    zone = zone_for_host(value)
+    if zone is not None:
+        return zone
+
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        address = None
+
+    if address is not None:
+        matches = {zone for network, zone in _SUBNET_ZONE_INDEX
+                   if address.version == network.version and address in network}
+        return next(iter(matches)) if len(matches) == 1 else None
+
+    try:
+        target_network = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return None
+
+    # Only resolve a target CIDR contained within one known zone subnet.
+    matches = {zone for network, zone in _SUBNET_ZONE_INDEX
+               if target_network.version == network.version
+               and target_network.subnet_of(network)}
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def action_name(action) -> str:
+    if action is None:
+        return ""
+    return type(action).__name__
+
+
+def _get_attr(action, names):
+    for name in names:
+        if isinstance(action, dict) and name in action:
+            return action[name]
+        if hasattr(action, name):
+            value = getattr(action, name)
+            if value is not None:
+                return value
+    return None
+
+
+def action_target_host(action) -> Optional[str]:
+    value = _get_attr(action, ("hostname", "target_hostname", "target_host", "host", "ip_address"))
+    if value is None:
+        # Some action objects use a positional/keyword target field in their __dict__.
+        attrs = vars(action) if hasattr(action, "__dict__") else {}
+        for key, candidate in attrs.items():
+            if "host" in key.lower() and isinstance(candidate, str):
+                value = candidate
+                break
+    if value is None:
+        return None
+    return str(value)
+
+
+def action_success(action) -> Optional[bool]:
+    value = _get_attr(action, ("success", "action_success"))
+    return value if isinstance(value, bool) else None
+
+
+def classify_action_event(step: int, action, host: Optional[str] = None) -> Optional[RedEvent]:
+    name = action_name(action)
+    host = host or action_target_host(action)
+    zone = resolve_zone_for_target(host) if host else None
+    if zone is None:
+        return None
+    success = action_success(action)
+    if name in DAMAGE_ACTIONS:
+        return RedEvent(step, zone, "damage", name, host, success)
+    if name in ATTACK_ACTIONS:
+        return RedEvent(step, zone, "attack_attempt", name, host, success)
+    if name in SCAN_ACTIONS:
+        return RedEvent(step, zone, "scan", name, host, success)
+    return None
+
+
+def merge_event_sequences(events: Iterable[RedEvent], gap: int = 5):
+    """Merge same-zone, same-category events separated by <= gap steps.
+
+    Returns episode dictionaries with first/last step, category, zone, sources,
+    and count. This deterministic rule is fixed before model evaluation.
+    """
+    if gap < 0:
+        raise ValueError("gap must be >= 0")
+    ordered = sorted(events, key=lambda e: (e.zone, e.category, e.step, e.source))
+    merged = []
+    for event in ordered:
+        if merged:
+            prev = merged[-1]
+            if (prev["zone"] == event.zone and prev["category"] == event.category
+                    and event.step - prev["last_step"] <= gap):
+                prev["last_step"] = event.step
+                prev["count"] += 1
+                prev["sources"].add(event.source)
+                if event.host:
+                    prev["hosts"].add(event.host)
+                continue
+        merged.append({"zone": event.zone, "category": event.category,
+                       "first_step": event.step, "last_step": event.step,
+                       "count": 1, "sources": {event.source},
+                       "hosts": {event.host} if event.host else set()})
+    for item in merged:
+        item["sources"] = sorted(item["sources"])
+        item["hosts"] = sorted(item["hosts"])
+    return merged
+
+
+def future_window_labels(events: Iterable[RedEvent], episode_steps: int, windows=(3, 5, 10), zones=None):
+    """Label each (step, zone) using events strictly after step through step+w.
+
+    Primary: attack_attempt OR compromise. Secondary: compromise-only.
+    Damage and scanning are separately retained as additional targets.
+    Events at step t do not label the prediction made from features at step t.
+    """
+    zones = list(zones or ("restricted_a", "operational_a", "restricted_b", "operational_b", "hq"))
+    events = list(events)
+    rows = []
+    for zone in zones:
+        zone_events = [e for e in events if e.zone == zone]
+        for step in range(episode_steps):
+            row = {"step": step, "zone": zone}
+            for window in windows:
+                upcoming = [e for e in zone_events if step < e.step <= step + int(window)]
+                row[f"attack_risk_{window}"] = int(any(e.category in {"attack_attempt", "compromise", "damage"} for e in upcoming))
+                row[f"compromise_risk_{window}"] = int(any(e.category == "compromise" for e in upcoming))
+                row[f"scan_risk_{window}"] = int(any(e.category == "scan" for e in upcoming))
+                row[f"damage_risk_{window}"] = int(any(e.category == "damage" for e in upcoming))
+            rows.append(row)
+    return rows
+
+
+def merge_attack_episodes(events: Iterable[RedEvent], gap: int = 5):
+    """Merge all attack/compromise/damage events within a zone into attack episodes.
+
+    Scans remain a separate category and are not merged into attack episodes.
+    Category-level reporting remains available from ``merge_event_sequences``.
+    """
+    attack_categories = {"attack_attempt", "compromise", "damage"}
+    normalized = [RedEvent(e.step, e.zone, "attack_episode", e.source, e.host, e.success)
+                  for e in events if e.category in attack_categories]
+    return merge_event_sequences(normalized, gap=gap)
