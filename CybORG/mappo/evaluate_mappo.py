@@ -12,24 +12,35 @@ from CybORG.mappo.prediction_v2.prediction_monitor import (
     MAPPOPredictionMonitor,
     save_prediction_results,
 )
-
+from CybORG.mappo.prediction_v2.config import ZONE_TO_AGENT
+from CybORG.mappo.prediction_v2.labels import (
+    future_window_labels,
+    set_subnet_inventory,
+)
+from CybORG.mappo.prediction_v2.simulator_adapter import (
+    install_action_capture,
+    true_state_red_sessions,
+    events_from_captures,
+    new_session_events,
+)
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mappo_model.pt")
+MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "mappo_model.pt"
+)
 
-# Keep these small while testing XAI.
-# Increase later after everything is working.
-NUM_EPISODES = 30
+NUM_EPISODES = 10
 STEPS_PER_EPISODE = 100
 
 XAI_TOP_K = 10
 XAI_MAX_FEATURES = 128
 XAI_BASELINE = 0.0
 XAI_FREQUENCY = 1
-PREDICTION_EPISODE_STEPS = 100  # Match prediction model training metadata
+PREDICTION_EPISODE_STEPS = 100
 
 
 # ============================================================
@@ -38,13 +49,10 @@ PREDICTION_EPISODE_STEPS = 100  # Match prediction model training metadata
 
 def get_current_action_masks(env):
     """Get the current action mask for every agent."""
-
     action_masks = {}
 
     for agent_id in env.agent_ids:
-        action_masks[agent_id] = env.get_action_mask(
-            agent_id
-        )
+        action_masks[agent_id] = env.get_action_mask(agent_id)
 
     return action_masks
 
@@ -60,23 +68,18 @@ def extract_reset_data(reset_result, env):
 
         for item in reset_result:
             if isinstance(item, dict):
-                if any(
-                    agent_id in item
-                    for agent_id in env.agent_ids
-                ):
+                if any(agent_id in item for agent_id in env.agent_ids):
                     observations = item
                     break
 
         if observations is None:
             raise RuntimeError(
-                "Could not identify observations "
-                "from env.reset() output."
+                "Could not identify observations from env.reset() output."
             )
 
     else:
         raise RuntimeError(
-            "Unexpected env.reset() return type: "
-            f"{type(reset_result)}"
+            f"Unexpected env.reset() return type: {type(reset_result)}"
         )
 
     action_masks = get_current_action_masks(env)
@@ -89,8 +92,7 @@ def extract_step_data(step_result, env):
 
     if not isinstance(step_result, tuple):
         raise RuntimeError(
-            "Unexpected env.step() return type: "
-            f"{type(step_result)}"
+            f"Unexpected env.step() return type: {type(step_result)}"
         )
 
     if len(step_result) == 4:
@@ -107,8 +109,7 @@ def extract_step_data(step_result, env):
 
     else:
         raise RuntimeError(
-            "Unexpected env.step() output length: "
-            f"{len(step_result)}"
+            f"Unexpected env.step() output length: {len(step_result)}"
         )
 
     action_masks = get_current_action_masks(env)
@@ -123,12 +124,7 @@ def extract_step_data(step_result, env):
 
 
 def get_feature_names(env, agent_id):
-    """
-    Get feature names from the environment.
-
-    Falls back to generic names if the environment does not
-    expose get_feature_names().
-    """
+    """Get feature names from the environment."""
 
     if hasattr(env, "get_feature_names"):
         try:
@@ -165,43 +161,60 @@ def load_mappo_checkpoint(mappo, model_path, device):
 
     if not isinstance(checkpoint, dict):
         raise RuntimeError(
-            "Unsupported checkpoint format: "
-            f"{type(checkpoint)}"
+            f"Unsupported checkpoint format: {type(checkpoint)}"
         )
 
     encoder_version = checkpoint.get("observation_encoder_version")
-    if encoder_version is not None and encoder_version != "semantic_enum_aggregate_v1":
+
+    if (
+        encoder_version is not None
+        and encoder_version != "semantic_enum_aggregate_v1"
+    ):
         raise RuntimeError(
             "Checkpoint encoder version does not match this environment: "
             f"{encoder_version!r}. Refusing to generate misleading explanations."
         )
 
-    encoder_verified = encoder_version == "semantic_enum_aggregate_v1"
+    encoder_verified = (
+        encoder_version == "semantic_enum_aggregate_v1"
+    )
+
     if not encoder_verified:
         print("WARNING: checkpoint has no observation-encoder metadata.")
         print("Semantic feature names will be disabled; XAI will report only")
         print("numeric input-dimension sensitivity, not semantic explanations.")
 
     expected_dims = {
-        "observation_dim": mappo.actors[0].network[0].in_features
-            if hasattr(mappo.actors[0], "network") and len(mappo.actors[0].network) > 0
-            and hasattr(mappo.actors[0].network[0], "in_features") else None,
-        "action_dim": len(mappo.actors[0].network[-1].weight)
-            if hasattr(mappo.actors[0], "network") and len(mappo.actors[0].network) > 0
-            and hasattr(mappo.actors[0].network[-1], "weight") else None,
+        "observation_dim": (
+            mappo.actors[0].network[0].in_features
+            if hasattr(mappo.actors[0], "network")
+            and len(mappo.actors[0].network) > 0
+            and hasattr(mappo.actors[0].network[0], "in_features")
+            else None
+        ),
+        "action_dim": (
+            len(mappo.actors[0].network[-1].weight)
+            if hasattr(mappo.actors[0], "network")
+            and len(mappo.actors[0].network) > 0
+            and hasattr(mappo.actors[0].network[-1], "weight")
+            else None
+        ),
         "num_agents": len(mappo.actors),
     }
+
     for key, expected in expected_dims.items():
         saved = checkpoint.get(key)
-        if saved is not None and expected is not None and int(saved) != int(expected):
+
+        if (
+            saved is not None
+            and expected is not None
+            and int(saved) != int(expected)
+        ):
             raise RuntimeError(
                 f"Checkpoint {key}={saved} does not match model value {expected}."
             )
 
-    # --------------------------------------------------------
     # Actors
-    # --------------------------------------------------------
-
     actor_states = None
 
     if "actors" in checkpoint:
@@ -226,23 +239,14 @@ def load_mappo_checkpoint(mappo, model_path, device):
         )
 
     for i, actor_state in enumerate(actor_states):
-        mappo.actors[i].load_state_dict(
-            actor_state
-        )
+        mappo.actors[i].load_state_dict(actor_state)
 
-    # --------------------------------------------------------
     # Critic
-    # --------------------------------------------------------
-
     if "critic" in checkpoint:
-        mappo.critic.load_state_dict(
-            checkpoint["critic"]
-        )
+        mappo.critic.load_state_dict(checkpoint["critic"])
 
     elif "critic_state_dict" in checkpoint:
-        mappo.critic.load_state_dict(
-            checkpoint["critic_state_dict"]
-        )
+        mappo.critic.load_state_dict(checkpoint["critic_state_dict"])
 
     else:
         raise RuntimeError(
@@ -251,6 +255,7 @@ def load_mappo_checkpoint(mappo, model_path, device):
 
     print("Trained MAPPO model loaded successfully.")
     print(f"Checkpoint path: {os.path.abspath(model_path)}")
+
     return encoder_verified
 
 
@@ -265,18 +270,14 @@ def calculate_step_reward(rewards, agent_ids):
                 continue
 
             try:
-                agent_rewards.append(
-                    float(rewards[agent_id])
-                )
+                agent_rewards.append(float(rewards[agent_id]))
             except (TypeError, ValueError):
                 continue
 
         if not agent_rewards:
             return 0.0
 
-        return float(
-            sum(agent_rewards) / len(agent_rewards)
-        )
+        return float(sum(agent_rewards) / len(agent_rewards))
 
     try:
         return float(rewards)
@@ -289,12 +290,7 @@ def is_terminated(terminated, agent_ids):
 
     if isinstance(terminated, dict):
         return all(
-            bool(
-                terminated.get(
-                    agent_id,
-                    False
-                )
-            )
+            bool(terminated.get(agent_id, False))
             for agent_id in agent_ids
         )
 
@@ -303,6 +299,7 @@ def is_terminated(terminated, agent_ids):
 
 def sanitize_xai_context(context):
     """Keep only descriptive, non-identifying context for the CSV."""
+
     if not isinstance(context, dict):
         return {}
 
@@ -310,6 +307,7 @@ def sanitize_xai_context(context):
         "success", "ostype", "os_type", "osdistribution",
         "os_distribution", "osversion", "os_version", "architecture",
     )
+
     blocked_key_parts = (
         "hostname", "host_name", "ip", "address", "subnet",
         "interface", "username", "user_name", "session", "process",
@@ -317,17 +315,31 @@ def sanitize_xai_context(context):
     )
 
     safe = {}
+
     for key, value in context.items():
         key_text = str(key).lower()
-        compact_key = "".join(ch for ch in key_text if ch.isalnum())
-        if any(part.replace("_", "") in compact_key for part in blocked_key_parts):
+        compact_key = "".join(
+            ch for ch in key_text if ch.isalnum()
+        )
+
+        if any(
+            part.replace("_", "") in compact_key
+            for part in blocked_key_parts
+        ):
             continue
-        if not any(part.replace("_", "") in compact_key for part in allowed_key_parts):
+
+        if not any(
+            part.replace("_", "") in compact_key
+            for part in allowed_key_parts
+        ):
             continue
+
         if isinstance(value, (str, int, float, bool)) or value is None:
             safe[str(key)] = value
+
         elif hasattr(value, "name"):
             safe[str(key)] = str(value.name)
+
     return safe
 
 
@@ -338,6 +350,7 @@ def make_csv_row(common_row, feature=None):
 
     if feature is None:
         row["record_type"] = "DECISION_ONLY"
+
         row.update({
             "feature_index": "",
             "feature_name": "",
@@ -351,6 +364,7 @@ def make_csv_row(common_row, feature=None):
 
     else:
         row["record_type"] = "FEATURE_ATTRIBUTION"
+
         row.update({
             "feature_index": feature.get("index", ""),
             "feature_name": feature.get("name", ""),
@@ -377,25 +391,15 @@ def evaluate_mappo():
     print("                 MAPPO + XAI EVALUATION")
     print("=" * 70)
 
-    # --------------------------------------------------------
     # Device
-    # --------------------------------------------------------
-
     device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
+        "cuda" if torch.cuda.is_available() else "cpu"
     )
 
     print(f"Device              : {device}")
 
-    # --------------------------------------------------------
     # Environment
-    # --------------------------------------------------------
-
-    env = CybORGMAPPOEnv(
-        steps=STEPS_PER_EPISODE
-    )
+    env = CybORGMAPPOEnv(steps=STEPS_PER_EPISODE)
 
     agent_ids = list(env.agent_ids)
     num_agents = len(agent_ids)
@@ -409,10 +413,7 @@ def evaluate_mappo():
     print(f"XAI max features    : {XAI_MAX_FEATURES}")
     print(f"XAI frequency       : every {XAI_FREQUENCY} step(s)")
 
-    # --------------------------------------------------------
     # MAPPO
-    # --------------------------------------------------------
-
     mappo = MAPPO(
         observation_dim=observation_dim,
         action_dim=action_dim,
@@ -421,10 +422,7 @@ def evaluate_mappo():
         device=device,
     )
 
-    # --------------------------------------------------------
     # Load trained model
-    # --------------------------------------------------------
-
     print()
     print("Loading trained MAPPO model...")
 
@@ -443,19 +441,13 @@ def evaluate_mappo():
         env.close()
         return
 
-    # --------------------------------------------------------
     # Evaluation mode
-    # --------------------------------------------------------
-
     for actor in mappo.actors:
         actor.eval()
 
     mappo.critic.eval()
 
-    # --------------------------------------------------------
     # XAI
-    # --------------------------------------------------------
-
     explainer = MAPPOExplainer(
         mappo=mappo,
         top_k=XAI_TOP_K,
@@ -466,10 +458,7 @@ def evaluate_mappo():
     print()
     print("Perturbation-based XAI initialized.")
 
-    # --------------------------------------------------------
     # Action names
-    # --------------------------------------------------------
-
     action_names = getattr(
         env,
         "ACTION_NAMES",
@@ -492,20 +481,17 @@ def evaluate_mappo():
     for index, name in enumerate(action_names):
         print(f"{index}: {name}")
 
-    # --------------------------------------------------------
     # Evaluation data
-    # --------------------------------------------------------
-
     episode_rewards = []
     explanation_count = 0
     xai_rows = []
     prediction_rows = []
+    ground_truth_rows = []
+    prediction_event_rows = []
+
     prediction_monitor = MAPPOPredictionMonitor()
 
-    # --------------------------------------------------------
     # Episodes
-    # --------------------------------------------------------
-
     for episode in range(NUM_EPISODES):
 
         print()
@@ -519,24 +505,28 @@ def evaluate_mappo():
             reset_result,
             env
         )
+
         prediction_monitor.reset_episode()
+
+        # Initialize ground-truth event capture.
+        set_subnet_inventory(
+            env.env.environment_controller.state.subnets
+        )
+
+        event_captures = install_action_capture(env.env)
+        previous_red_hosts = true_state_red_sessions(env.env)
+        episode_events = []
 
         total_reward = 0.0
         steps_taken = 0
 
-        # ----------------------------------------------------
         # Steps
-        # ----------------------------------------------------
-
         for step in range(STEPS_PER_EPISODE):
 
             print()
             print(f"--- Step {step + 1} ---")
 
-            # ------------------------------------------------
             # Select MAPPO actions
-            # ------------------------------------------------
-
             with torch.no_grad():
                 actions = mappo.select_actions(
                     observations,
@@ -544,10 +534,7 @@ def evaluate_mappo():
                     deterministic=True
                 )
 
-            # ------------------------------------------------
             # Monitoring-only attack-risk predictions
-            # ------------------------------------------------
-
             step_predictions = prediction_monitor.predict_all(
                 observations=observations,
                 step=step,
@@ -573,19 +560,16 @@ def evaluate_mappo():
                 action_index = int(actions[agent_id])
 
                 if 0 <= action_index < len(action_names):
-                    action_name = action_names[action_index]
+                    selected_action_name = action_names[action_index]
                 else:
-                    action_name = f"Action {action_index}"
+                    selected_action_name = f"Action {action_index}"
 
                 print(
                     f"{agent_id:<20} "
-                    f"Action: {action_name}"
+                    f"Action: {selected_action_name}"
                 )
 
-            # ------------------------------------------------
             # XAI explanation
-            # ------------------------------------------------
-
             if (step + 1) % XAI_FREQUENCY == 0:
 
                 print()
@@ -613,49 +597,30 @@ def evaluate_mappo():
                             agent_id=agent_id,
                         )
 
-                        explainer.print_explanation(
-                            explanation
-                        )
-
-                        # ------------------------------------
-                        # Common information for every row
-                        # ------------------------------------
+                        explainer.print_explanation(explanation)
 
                         common_row = {
                             "episode": episode + 1,
                             "step": step + 1,
                             "agent_id": agent_id,
-
                             "selected_action": explanation.get(
-                                "selected_action_name",
-                                ""
+                                "selected_action_name", ""
                             ),
-
                             "action_probability": explanation.get(
-                                "selected_probability",
-                                ""
+                                "selected_probability", ""
                             ),
-
                             "decision_margin": explanation.get(
-                                "decision_margin",
-                                ""
+                                "decision_margin", ""
                             ),
-
                             "explanation_status": explanation.get(
-                                "status",
-                                "STATUS_NOT_PROVIDED"
+                                "status", "STATUS_NOT_PROVIDED"
                             ),
-
                             "attribution_type": explanation.get(
-                                "attribution_type",
-                                "TYPE_NOT_PROVIDED"
+                                "attribution_type", "TYPE_NOT_PROVIDED"
                             ),
-
                             "interpretation": explanation.get(
-                                "interpretation",
-                                ""
+                                "interpretation", ""
                             ),
-
                             "xai_context": json.dumps(
                                 sanitize_xai_context(
                                     env.get_xai_context(agent_id)
@@ -667,27 +632,14 @@ def evaluate_mappo():
                             ),
                         }
 
-                        # ------------------------------------
-                        # Save feature-level explanations
-                        # ------------------------------------
-
-                        features = explanation.get(
-                            "features",
-                            []
-                        )
+                        features = explanation.get("features", [])
 
                         if features:
                             for feature in features:
                                 xai_rows.append(
-                                    make_csv_row(
-                                        common_row,
-                                        feature
-                                    )
+                                    make_csv_row(common_row, feature)
                                 )
-
                         else:
-                            # Keep the decision record even when
-                            # feature-level attribution is unavailable.
                             xai_rows.append(
                                 make_csv_row(common_row)
                             )
@@ -696,13 +648,12 @@ def evaluate_mappo():
 
                     except Exception as error:
                         print()
-                        print(
-                            f"XAI error for {agent_id}: {error}"
-                        )
+                        print(f"XAI error for {agent_id}: {error}")
 
-            # ------------------------------------------------
             # Environment step
-            # ------------------------------------------------
+            # Clear old captured actions BEFORE this step.
+            for capture in event_captures.values():
+                capture["action"] = None
 
             step_result = env.step(actions)
 
@@ -717,10 +668,24 @@ def evaluate_mappo():
                 env
             )
 
-            # ------------------------------------------------
-            # Reward
-            # ------------------------------------------------
+            # Capture Red actions and newly established Red sessions.
+            episode_events.extend(
+                events_from_captures(step + 1, event_captures)
+            )
 
+            current_red_hosts = true_state_red_sessions(env.env)
+
+            episode_events.extend(
+                new_session_events(
+                    step + 1,
+                    previous_red_hosts,
+                    current_red_hosts,
+                )
+            )
+
+            previous_red_hosts = current_red_hosts
+
+            # Reward
             step_reward = calculate_step_reward(
                 rewards,
                 agent_ids
@@ -732,21 +697,48 @@ def evaluate_mappo():
             print()
             print(f"Step reward: {step_reward:.4f}")
 
-            # ------------------------------------------------
             # Update state
-            # ------------------------------------------------
-
             observations = next_observations
             action_masks = next_action_masks
 
-            # ------------------------------------------------
             # Termination
-            # ------------------------------------------------
-
             if is_terminated(terminated, agent_ids):
                 print()
                 print("Episode terminated.")
                 break
+
+        # ----------------------------------------------------
+        # Generate ground-truth labels for this episode
+        # ----------------------------------------------------
+
+        episode_labels = future_window_labels(
+            events=episode_events,
+            episode_steps=steps_taken,
+            windows=(3, 5, 10),
+            zones=ZONE_TO_AGENT.keys(),
+        )
+
+        for label in episode_labels:
+            row = dict(label)
+            row["episode"] = episode + 1
+
+            # Convert label step from zero-based to one-based
+            # to match prediction_results.csv.
+            row["step"] = int(row["step"]) + 1
+
+            ground_truth_rows.append(row)
+
+        # Save raw captured events for auditing.
+        for event in episode_events:
+            prediction_event_rows.append({
+                "episode": episode + 1,
+                "step": event.step,
+                "zone": event.zone,
+                "category": event.category,
+                "source": event.source,
+                "host": event.host or "",
+                "success": event.success,
+            })
 
         episode_rewards.append(total_reward)
 
@@ -754,7 +746,9 @@ def evaluate_mappo():
         print(
             f"Episode {episode + 1} completed | "
             f"Reward: {total_reward:.4f} | "
-            f"Steps: {steps_taken}"
+            f"Steps: {steps_taken} | "
+            f"Captured events: {len(episode_events)} | "
+            f"Ground-truth rows: {len(episode_labels)}"
         )
 
     # ========================================================
@@ -768,26 +762,22 @@ def evaluate_mappo():
 
     mean_reward = (
         float(np.mean(episode_rewards))
-        if len(episode_rewards) > 0
-        else 0.0
+        if len(episode_rewards) > 0 else 0.0
     )
 
     std_reward = (
         float(np.std(episode_rewards))
-        if len(episode_rewards) > 0
-        else 0.0
+        if len(episode_rewards) > 0 else 0.0
     )
 
     best_reward = (
         float(np.max(episode_rewards))
-        if len(episode_rewards) > 0
-        else 0.0
+        if len(episode_rewards) > 0 else 0.0
     )
 
     worst_reward = (
         float(np.min(episode_rewards))
-        if len(episode_rewards) > 0
-        else 0.0
+        if len(episode_rewards) > 0 else 0.0
     )
 
     # ========================================================
@@ -835,9 +825,7 @@ def evaluate_mappo():
             )
 
             writer.writeheader()
-            
-            # Final XAI privacy guard. Match whole tokens, not substrings:
-            # e.g. do not hide valid names containing "session" or "port".
+
             blocked_tokens = {
                 "pid", "ppid", "uid", "gid", "session", "sessions",
                 "sessionid", "processid", "parentprocessid", "groupid",
@@ -847,12 +835,21 @@ def evaluate_mappo():
             }
 
             for row in xai_rows:
-                name = str(row.get("feature_name", "") or "").strip()
+                name = str(
+                    row.get("feature_name", "") or ""
+                ).strip()
+
                 normalized = "".join(
-                    ch.lower() if ch.isalnum() else " " for ch in name
+                    ch.lower() if ch.isalnum() else " "
+                    for ch in name
                 )
+
                 tokens = set(normalized.split())
-                compact = "".join(ch.lower() for ch in name if ch.isalnum())
+
+                compact = "".join(
+                    ch.lower() for ch in name if ch.isalnum()
+                )
+
                 identifier_like = (
                     bool(tokens.intersection(blocked_tokens))
                     or any(token in compact for token in (
@@ -866,14 +863,17 @@ def evaluate_mappo():
                     row["record_type"] = "EXCLUDED_FEATURE"
                     row["explanation_status"] = "EXCLUDED_FEATURE"
                     row["attribution_type"] = "excluded_identifier_like"
+
                     for field in (
                         "feature_index", "feature_name", "feature_value",
                         "perturbed_probability", "probability_effect",
                         "effect", "importance", "direction",
                     ):
                         row[field] = ""
+
                     row["interpretation"] = (
-                        "Excluded identifier-like feature; not a semantic explanation."
+                        "Excluded identifier-like feature; "
+                        "not a semantic explanation."
                     )
 
             writer.writerows(xai_rows)
@@ -887,11 +887,13 @@ def evaluate_mappo():
         print(f"ERROR saving XAI CSV: {error}")
 
     # ========================================================
-    # SAVE PREDICTION RESULTS (SEPARATE FROM XAI)
+    # SAVE PREDICTION RESULTS
     # ========================================================
 
+    output_dir = os.path.dirname(__file__)
+
     prediction_csv_path = os.path.join(
-        os.path.dirname(__file__),
+        output_dir,
         "prediction_results.csv"
     )
 
@@ -900,12 +902,101 @@ def evaluate_mappo():
             prediction_rows,
             prediction_csv_path
         )
+
         print()
         print(f"Prediction CSV saved to: {prediction_csv_path}")
         print(f"Prediction data rows   : {len(prediction_rows)}")
+
     except OSError as error:
         print()
         print(f"ERROR saving prediction CSV: {error}")
+
+    # ========================================================
+    # SAVE PREDICTION GROUND TRUTH
+    # ========================================================
+
+    ground_truth_path = os.path.join(
+        output_dir,
+        "prediction_ground_truth.csv"
+    )
+
+    event_path = os.path.join(
+        output_dir,
+        "prediction_events.csv"
+    )
+
+    # Save zone-level future attack labels.
+    try:
+        if ground_truth_rows:
+            ground_truth_fields = list(
+                ground_truth_rows[0].keys()
+            )
+
+            with open(
+                ground_truth_path,
+                "w",
+                newline="",
+                encoding="utf-8"
+            ) as csv_file:
+
+                writer = csv.DictWriter(
+                    csv_file,
+                    fieldnames=ground_truth_fields
+                )
+
+                writer.writeheader()
+                writer.writerows(ground_truth_rows)
+
+            print()
+            print(
+                f"Ground-truth CSV saved: {ground_truth_path}"
+            )
+            print(
+                f"Ground-truth rows: {len(ground_truth_rows)}"
+            )
+
+        else:
+            print()
+            print("WARNING: No ground-truth labels were generated.")
+
+    except OSError as error:
+        print()
+        print(f"ERROR saving ground-truth CSV: {error}")
+
+    # Save raw Red attack events for auditing.
+    event_fields = [
+        "episode",
+        "step",
+        "zone",
+        "category",
+        "source",
+        "host",
+        "success",
+    ]
+
+    try:
+        with open(
+            event_path,
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as csv_file:
+
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=event_fields
+            )
+
+            writer.writeheader()
+            writer.writerows(prediction_event_rows)
+
+        print()
+        print(f"Prediction events CSV saved: {event_path}")
+        print(f"Captured event rows: {len(prediction_event_rows)}")
+
+    except OSError as error:
+        print()
+        print(f"ERROR saving prediction events CSV: {error}")
 
     # ========================================================
     # FINAL RESULTS
@@ -924,6 +1015,9 @@ def evaluate_mappo():
     print(f"XAI explanations   : {explanation_count}")
     print(f"XAI feature rows   : {len(xai_rows)}")
     print(f"XAI results CSV    : {xai_csv_path}")
+    print(f"Prediction rows    : {len(prediction_rows)}")
+    print(f"Ground-truth rows  : {len(ground_truth_rows)}")
+    print(f"Captured events    : {len(prediction_event_rows)}")
 
     print("=" * 70)
 
@@ -936,5 +1030,3 @@ def evaluate_mappo():
 
 if __name__ == "__main__":
     evaluate_mappo()
-
-
